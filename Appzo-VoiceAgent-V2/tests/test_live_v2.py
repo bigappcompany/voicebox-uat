@@ -116,6 +116,71 @@ class LiveRoutingTests(unittest.IsolatedAsyncioTestCase):
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
+    async def test_confirmed_transcription_barge_in_flushes_queued_response(self):
+        """Quiet speech starts from STT only, then becomes a real interruption.
+
+        A single late transcription event remains harmless, but fresh meaningful
+        interim text must cancel the old turn and broadcast an interruption so
+        Plivo cannot play its buffered audio ahead of the new response.
+        """
+        task = asyncio.create_task(asyncio.sleep(30))
+        from main import LLMRequest
+        old_state = self.controller._state
+        old_state.committed = True
+        old_state.final_request = LLMRequest("old", False, task=task)
+        self.controller.session.history = [{"role": "assistant", "content": "Old response."}]
+        self.controller.broadcast_interruption = AsyncMock()
+        self.controller._spec_min_chars = 10_000  # This test covers barge-in, not speculation.
+
+        await self.controller.handle_native_turn_started(transcription_only=True)
+        await self.controller._on_interim("please stop")
+        await asyncio.gather(task, return_exceptions=True)
+
+        self.assertTrue(task.cancelled())
+        self.controller.broadcast_interruption.assert_awaited_once()
+        self.assertNotEqual(self.controller._state.turn_id, old_state.turn_id)
+        self.assertTrue(self.controller.session.history[-1]["content"].endswith("[Playback may have been interrupted.]"))
+
+    async def test_final_segment_does_not_replace_complete_aggregate(self):
+        self.controller._commit_final_turn = AsyncMock()
+        self.controller._settle_seconds = 0.05
+        await self.controller.handle_native_turn_stopped("complete request with details")
+        await asyncio.sleep(0)
+        self.controller.note_stt_final(True)
+        await self.controller._on_final_transcript("with details")
+        await self.controller._settle_task
+
+        self.assertEqual(self.controller._state.final_transcript, "complete request with details")
+        self.controller._commit_final_turn.assert_awaited_once()
+
+    async def test_changed_suffix_rejects_speculation(self):
+        self.client.chat.completions.create.return_value = FakeStream(["Which roles do you need?"])
+        await self.controller._on_interim("we need four")
+        await self.controller._on_interim("we need four engineers")
+        candidate = self.controller._state.candidate
+        await candidate.task
+        plan, _ = self.controller._response_plan("we need four engineers but not now")
+        self.assertFalse(self.controller._candidate_matches(candidate, "we need four engineers but not now", plan))
+
+    async def test_flux_eager_is_private_and_resume_invalidates(self):
+        self.controller._flux_mode = True
+        self.client.chat.completions.create.return_value = FakeStream(["Which roles do you need?"])
+        await self.controller._on_interim("we need four engineers")
+        self.assertIsNone(self.controller._state.candidate)
+        self.controller._flux_eager = True
+        await self.controller._on_interim("we need four engineers")
+        await self.controller._state.candidate.task
+        self.controller.push_frame.assert_not_awaited()
+        await self.controller._invalidate_candidate()
+        self.assertIsNone(self.controller._state.candidate)
+
+    async def test_punctuated_callback_time_is_local(self):
+        from main import normalize
+        self.controller.session.history = [{"role": "assistant", "content": "What time tomorrow is convenient?"}]
+        state = await self.answer(normalize("Okay, three p.m. tomorrow please."))
+        self.assertEqual(state.metrics.route, "v2-callback-preference")
+        self.client.chat.completions.create.assert_not_awaited()
+
     async def test_identity_question_bypasses_the_model(self):
         self.controller._company_name = "The Hiring Company"
         state = await self.answer("who is this")

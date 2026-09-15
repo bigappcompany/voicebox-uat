@@ -19,7 +19,11 @@ from pipecat.frames.frames import (
     LLMTextFrame,
     TTSAudioRawFrame,
     TTSStoppedFrame,
+    InterimTranscriptionFrame,
+    TranscriptionFrame,
 )
+from pipecat.processors.frame_processor import FrameDirection
+from voice_agent.turns.flux import FluxResumeFrame
 
 from main import LLMRequest, StreamingVoiceController, normalize
 from voice_agent.llm.prompt_builder import PromptBuilder
@@ -31,6 +35,7 @@ from voice_agent.runtime.response_plan import ResponsePlan
 from voice_agent.speech.safe_chunker import SafeSpeechChunker
 from voice_agent.speech.speculative_cartesia import SpeculativeCartesiaBuffer
 from voice_agent.speech.stream_filter import SpeechStreamFilter
+from voice_agent.speech.booking_guard import BookingClaimGuard
 from voice_agent.turns.transcript_stability import TranscriptStabilityAnalyzer
 
 
@@ -44,15 +49,20 @@ class V2RoutingController(StreamingVoiceController):
         cartesia_model: str | None = None,
         cartesia_speed: float = 1.0,
         tts_transport: str = "websocket",
+        flux_mode: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.session = session
+        self._flux_mode = flux_mode
+        self._flux_eager = False
+        self._closed_flux_turns = set()
         self.router = DeterministicRouter()
         self.flow_engine = FlowEngine()
         self.slot_validator = SlotValidator()
         self.prompt_builder = PromptBuilder()
         self._pending_text = ""
+        self._latest_finalized_text = ""
         self._settle_task: asyncio.Task | None = None
         self._native_stop_at: float | None = None
         self._company_name = os.getenv("V2_COMPANY_NAME") or session.agent.identity.get("company_name")
@@ -60,8 +70,20 @@ class V2RoutingController(StreamingVoiceController):
             os.getenv("V2_STREAM_SPEECH", "true").lower() == "true"
             and tts_transport == "websocket"
         )
-        self._settle_seconds = float(os.getenv("V2_TURN_SETTLE_SECS", "0"))
+        # Nova can deliver a provisional aggregate immediately before its
+        # final transcript.  A tiny settle window prevents that trailing final
+        # from becoming a second turn. Flux final frames are marked finalized,
+        # so Flux takes the zero-delay branch below.
+        self._settle_seconds = float(os.getenv("V2_TURN_SETTLE_SECS", "0.18"))
         self._stt_finalized = False
+        self._transcription_barge_in_pending = False
+        self._transcription_barge_in_turn_id: int | None = None
+        self._transcription_barge_in_min_words = int(
+            os.getenv("V2_TRANSCRIPTION_BARGE_IN_MIN_WORDS", "2")
+        )
+        self._transcription_barge_in_min_chars = int(
+            os.getenv("V2_TRANSCRIPTION_BARGE_IN_MIN_CHARS", "8")
+        )
         self._stability = TranscriptStabilityAnalyzer()
         self._spec_min_words = int(os.getenv("V2_SPECULATION_MIN_WORDS", "3"))
         self._spec_min_chars = int(os.getenv("V2_SPECULATION_MIN_CHARS", "12"))
@@ -86,21 +108,63 @@ class V2RoutingController(StreamingVoiceController):
         elif self._enable_spec_tts and self._streaming:
             logger.warning("V2 speculative TTS is enabled but Cartesia runtime settings are incomplete")
 
+    async def process_frame(self, frame, direction):
+        if direction == FrameDirection.DOWNSTREAM and self._flux_mode:
+            if isinstance(frame, FluxResumeFrame):
+                await self._invalidate_candidate()
+            elif isinstance(frame, InterimTranscriptionFrame):
+                self._flux_eager = (frame.result or {}).get("event") == "EagerEndOfTurn"
+            elif isinstance(frame, TranscriptionFrame):
+                result = frame.result or {}
+                turn_id = result.get("turn_index")
+                if turn_id is not None and turn_id in self._closed_flux_turns:
+                    return
+                if turn_id is not None:
+                    self._closed_flux_turns.add(turn_id)
+                if self._state:
+                    self._state.metrics.provider_eot_at = result.get("runtime_eot_at")
+                    self._state.metrics.provider_turn_id = turn_id
+        await super().process_frame(frame, direction)
+
+    async def _invalidate_candidate(self):
+        state = self._state
+        if state and not state.committed and state.candidate:
+            self._cancel_task(state.candidate.task)
+            await self._abort_spec_audio(state.candidate)
+            state.candidate = None
+            state.metrics.speculative_started_at = None
+            state.metrics.llm_first_token_at = None
+            state.metrics.first_safe_text_at = None
+
     async def _on_interim(self, text: str) -> None:
         """Prepare one low-risk response from a stable interim prefix."""
         self._stt_finalized = False
         state = self._state
+        interim = normalize(text)
+        # A transcription start is a deliberate soft fallback for quiet
+        # callers.  Formerly we ignored it forever to protect against a late
+        # previous-turn transcript. That left already-buffered bot speech
+        # alive, so its audio could be attributed to (and queue behind) the
+        # next answer. Require meaningful fresh interim text before treating
+        # that fallback as a real barge-in.
+        if state is not None and state.committed and self._transcription_barge_in_pending:
+            if self._is_meaningful_barge_in(interim):
+                await self._confirm_transcription_barge_in()
+                state = self._state
         if state is None:
             await self._start_turn()
             state = self._state
         if state is None or state.committed or state.turn_stopped:
             return
-        interim = normalize(text)
         if not interim:
             return
         state.latest_interim = interim
+        if self._flux_mode and not self._flux_eager:
+            return
         hypothesis = self._stability.update(interim)
-        basis = hypothesis.stable_prefix
+        basis = interim
+        if not self._flux_mode and not hypothesis.stable_prefix:
+            return
         if len(basis) < self._spec_min_chars or len(basis.split()) < self._spec_min_words:
             return
 
@@ -126,30 +190,48 @@ class V2RoutingController(StreamingVoiceController):
         logger.debug("V2 SOFT-EOT turn={} stable_words={} route={}", state.turn_id, len(basis.split()), plan.route)
 
     async def _on_final_transcript(self, text: str) -> None:
-        # Pipecat's universal aggregator supplies the complete hard-EOT text.
+        # Pipecat's universal aggregator normally supplies the complete
+        # hard-EOT text. Preserve a just-arrived finalized transcript during
+        # the short Nova settle window so it replaces an earlier provisional
+        # aggregate rather than opening a duplicate turn.
+        # Final frames may be segments. Only the aggregator owns assembly;
+        # replacing its complete text with the last frame loses earlier words.
         return
 
     def note_stt_final(self, finalized: bool) -> None:
         self._stt_finalized = finalized
 
     async def handle_native_turn_started(self, *, transcription_only: bool = False) -> None:
-        # Late transcription starts often belong to the previous turn; only a
-        # VAD-confirmed start is allowed to cancel audible or speculative work.
+        # A raw transcription start may be a delayed result from the previous
+        # turn. Record it first; a meaningful interim or final transcript will
+        # confirm the barge-in and explicitly interrupt queued output.
         if transcription_only:
+            if self._state and self._state.committed:
+                self._transcription_barge_in_pending = True
+                self._transcription_barge_in_turn_id = self._state.turn_id
             return
-        if self._state and self._state.committed and self.session.history:
-            last = self.session.history[-1]
-            if last["role"] == "assistant" and not last["content"].endswith("[Playback may have been interrupted.]"):
-                last["content"] += " [Playback may have been interrupted.]"
+        self._transcription_barge_in_pending = False
+        self._transcription_barge_in_turn_id = None
+        self._mark_prior_playback_interrupted()
         if self._settle_task and not self._settle_task.done():
             self._settle_task.cancel()
         if self._state and self._state.candidate:
             self._cancel_task(self._state.candidate.task)
             await self._abort_spec_audio(self._state.candidate)
         await super().handle_native_turn_started()
+        self._stability = TranscriptStabilityAnalyzer()
+        self._latest_finalized_text = ""
 
     async def handle_native_turn_stopped(self, transcript: str | None = None) -> None:
         self._native_stop_at = time.perf_counter()
+        if self._state:
+            self._state.metrics.aggregator_stop_at = self._native_stop_at
+            self._native_stop_at = self._state.metrics.provider_eot_at or self._native_stop_at
+        # A short quiet utterance may never reach the interim threshold. Its
+        # final aggregate still confirms that the pending transcription start
+        # was genuine, so it must clear any queued bot audio before we commit.
+        if self._transcription_barge_in_pending and normalize(transcript or ""):
+            await self._confirm_transcription_barge_in()
         if transcript:
             # Pipecat gives an aggregate. Concatenating callbacks fabricated
             # utterances and directly caused the earlier wrong answers.
@@ -161,7 +243,44 @@ class V2RoutingController(StreamingVoiceController):
     async def _settle_turn(self) -> None:
         await asyncio.sleep(0 if self._stt_finalized else self._settle_seconds)
         text, self._pending_text = self._pending_text, ""
+        self._latest_finalized_text = ""
         await super().handle_native_turn_stopped(text)
+
+    def _is_meaningful_barge_in(self, text: str) -> bool:
+        return bool(
+            text
+            and len(text) >= self._transcription_barge_in_min_chars
+            and len(text.split()) >= self._transcription_barge_in_min_words
+        )
+
+    def _mark_prior_playback_interrupted(self) -> None:
+        if self._state and self._state.committed and self.session.history:
+            last = self.session.history[-1]
+            if last["role"] == "assistant" and not last["content"].endswith("[Playback may have been interrupted.]"):
+                last["content"] += " [Playback may have been interrupted.]"
+
+    async def _confirm_transcription_barge_in(self) -> None:
+        if not self._transcription_barge_in_pending:
+            return
+        state = self._state
+        self._transcription_barge_in_pending = False
+        self._transcription_barge_in_turn_id = None
+        if state is None or not state.committed:
+            return
+        self._mark_prior_playback_interrupted()
+        # The aggregator emitted an interruption when the fallback started,
+        # but it may have done so before a media queue was populated. Sending
+        # one more confirmed interruption guarantees Cartesia and Plivo flush
+        # the old response before the new turn is created.
+        await self.broadcast_interruption()
+        if self._settle_task and not self._settle_task.done():
+            self._settle_task.cancel()
+        if state.candidate:
+            self._cancel_task(state.candidate.task)
+            await self._abort_spec_audio(state.candidate)
+        await super().handle_native_turn_started()
+        self._latest_finalized_text = ""
+        logger.info("V2 confirmed transcription barge-in; previous turn={} interrupted", state.turn_id)
 
     async def _commit_final_turn(self, state) -> None:
         if state is not self._state or state.committed:
@@ -188,6 +307,8 @@ class V2RoutingController(StreamingVoiceController):
                 # phrase will be emitted normally. Waiting for a full phrase
                 # here would throw away the interim LLM head start.
                 pass
+            if self._state is not state:
+                return
             # A completed task that produced no safe text failed upstream, so
             # use a fresh final request for the normal error/fallback path.
             if candidate.task is None or (candidate.task.done() and not candidate.answer_chunks and not candidate.completed):
@@ -205,6 +326,9 @@ class V2RoutingController(StreamingVoiceController):
         if candidate:
             self._cancel_task(candidate.task)
             await self._abort_spec_audio(candidate)
+            state.metrics.speculative_started_at = None
+            state.metrics.llm_first_token_at = None
+            state.metrics.first_safe_text_at = None
         state.candidate = None
         state.metrics.speculation = "miss" if candidate else "none"
         state.metrics.route = "v2-" + plan.route
@@ -225,14 +349,20 @@ class V2RoutingController(StreamingVoiceController):
             routed = (ResponsePlan("identity"), f"I'm Riya, calling from {self._company_name} about your hiring plans.")
         previous = self.session.history[-1]["content"] if self.session.history else ""
         time_match = re.fullmatch(
-            r"(?:tomorrow )?(?:at )?(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|1[0-2]|[1-9]) "
-            r"(?:am|pm)(?: afternoon| morning| evening)?(?: tomorrow)?", text,
+            r"(?:(?:yes|okay|ok|please|make it|at|tomorrow) )*"
+            r"(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|1[0-2]|[1-9])"
+            r"(?: [0-5][0-9])? ?(?:a ?m|p ?m)"
+            r"(?: afternoon| morning| evening| tomorrow| please)*", text,
         )
-        if time_match and re.search(r"what time|convenient|preference", previous, re.I):
+        callback_context = re.search(r"what time|convenient|preference|follow.up|callback", previous, re.I)
+        if time_match and callback_context:
             routed = (
                 ResponsePlan("callback-preference", slots_written={"callback_preference": text}),
                 f"I've recorded your preference for {text}. This is a requested time, not a confirmed booking.",
             )
+        elif callback_context and text in {"tomorrow", "next week", "monday", "tuesday", "wednesday", "thursday", "friday"}:
+            routed = (ResponsePlan("callback-day", slots_written={"callback_day": text}),
+                      f"What time {text} would you prefer?")
         risk = str(self.session.agent.risk_policy.get("class", "LOW_PUBLIC"))
         if routed and routed[0].route == "cache" and risk != "LOW_PUBLIC":
             routed = None
@@ -312,7 +442,7 @@ class V2RoutingController(StreamingVoiceController):
             return False
         basis_words = normalize(candidate.transcript).split()
         final_words = normalize(final_text).split()
-        return bool(basis_words and len(final_words) >= len(basis_words) and final_words[:len(basis_words)] == basis_words)
+        return bool(basis_words and final_words == basis_words)
 
     def _messages(self, text: str, plan: ResponsePlan) -> list[dict[str, str]]:
         contract = (
@@ -342,6 +472,7 @@ class V2RoutingController(StreamingVoiceController):
         stream = None
         started = False
         speech_filter = SpeechStreamFilter()
+        booking_guard = BookingClaimGuard()
         chunker = SafeSpeechChunker(min_chars=self._safe_chunk_chars, min_words=self._safe_chunk_words)
         parts: list[str] = []
 
@@ -397,12 +528,12 @@ class V2RoutingController(StreamingVoiceController):
                         continue
                     if state.metrics.llm_first_token_at is None:
                         state.metrics.llm_first_token_at = time.perf_counter()
-                    clean = speech_filter.push(content)
+                    clean = booking_guard.push(speech_filter.push(content))
                     if clean:
                         parts.append(clean)
                         for safe in chunker.push(clean):
                             await emit_safe(safe)
-                tail = speech_filter.push("", final=True)
+                tail = booking_guard.push(speech_filter.push("", final=True), final=True)
                 if tail:
                     parts.append(tail)
                     for safe in chunker.push(tail):

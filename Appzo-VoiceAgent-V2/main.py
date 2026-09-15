@@ -44,10 +44,13 @@ from pipecat.processors.frameworks.rtvi.observer import RTVIObserverParams
 from pipecat.processors.frameworks.rtvi.processor import RTVIProcessor
 from pipecat.runner.types import RunnerArguments
 from pipecat.services.cartesia.tts import CartesiaTTSService, GenerationConfig
+from pipecat.services.deepgram.flux.stt import DeepgramFluxSTTService
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.tts_service import TextAggregationMode
+from pipecat.transcriptions.language import Language
 from pipecat.transports.base_transport import BaseTransport
-from pipecat.turns.user_start import VADUserTurnStartStrategy
+from pipecat.turns.user_start import TranscriptionUserTurnStartStrategy
+from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies
 from pipecat.workers.runner import WorkerRunner
 from websockets.asyncio.client import connect as websocket_connect
 
@@ -103,6 +106,9 @@ def normalize(text: str) -> str:
 @dataclass
 class TurnMetrics:
     turn_id: int
+    provider_eot_at: float | None = None
+    aggregator_stop_at: float | None = None
+    provider_turn_id: int | None = None
     last_voiced_at: float | None = None
     turn_committed_at: float | None = None
     final_stt_at: float | None = None
@@ -583,6 +589,7 @@ class LiveLatencyObserver(BaseObserver):
                 f"tenant={getattr(self._session, 'tenant_id', 'legacy')} bundle={getattr(getattr(self._session, 'agent', None), 'version', 'legacy')} "
                 f"state={getattr(self._session, 'state', {}).get('name', 'UNKNOWN') if self._session else 'LEGACY'} "
                 f"turn={metrics.turn_id} route={metrics.route} tts={self._tts_transport} speculation={metrics.speculation} spec_tts={metrics.spec_tts} | "
+                f"provider-turn={metrics.provider_turn_id} provider-EOT->aggregator={self._ms(metrics.provider_eot_at, metrics.aggregator_stop_at)} ms | "
                 f"native-EOT->bot-audio={native_eot_to_audio} ms | "
                 f"raw-audio->native-EOT={raw_audio_to_eot} ms | "
                 f"raw-audio->bot-audio={raw_audio_to_bot} ms | "
@@ -644,8 +651,16 @@ async def run_bot(
     if runtime_config is None:
         raise ValueError("V2 requires a Goodbox AgentRuntimeConfig at call start")
     runtime = runtime_config
-    logger.info("TURN config model={} stt={} endpointing_ms={} vad_stop_secs={} strategy=SmartTurn",
-                runtime.llm_model, runtime.stt_model, runtime.deepgram_endpointing_ms, runtime.vad_stop_secs)
+    use_flux = runtime.stt_model.lower().startswith("flux")
+    from voice_agent.turns.flux import OrderedFluxSTTService, flux_turn_strategies
+    logger.info(
+        "TURN config model={} stt={} endpointing_ms={} vad_stop_secs={} strategy={}",
+        runtime.llm_model,
+        runtime.stt_model,
+        runtime.deepgram_endpointing_ms,
+        runtime.vad_stop_secs,
+        "Flux/ExternalTurn" if use_flux else "SmartTurn",
+    )
     rtvi_processor = RTVIProcessor()
 
     async def publish_conversation_answer(text: str) -> None:
@@ -694,6 +709,7 @@ async def run_bot(
             cartesia_model=runtime.cartesia_model,
             cartesia_speed=runtime.cartesia_speed,
             tts_transport=resolved_tts_transport,
+            flux_mode=use_flux,
         )
         logger.info("V2 ROUTING enabled; deterministic/cache/hosted routes active")
     controller = controller_class(
@@ -715,10 +731,16 @@ async def run_bot(
         session=v2_session if controller_options else None,
     )
     context = LLMContext()
-    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
-        context,
-        user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(
+    # Flux owns start, resume and hard-EOT detection.  Giving the aggregator
+    # external strategies is essential: pairing Flux with Silero/SmartTurn
+    # would double-trigger turn boundaries and reintroduce the duplicate-turn
+    # tail latency seen in the Nova logs.
+    user_params = LLMUserAggregatorParams(
+        user_turn_strategies=flux_turn_strategies() if use_flux else None,
+        vad_analyzer=(
+            None
+            if use_flux
+            else SileroVADAnalyzer(
                 params=VADParams(
                     confidence=runtime.vad_confidence,
                     start_secs=runtime.vad_start_secs,
@@ -728,31 +750,53 @@ async def run_bot(
             )
         ),
     )
+    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+        context,
+        user_params=user_params,
+    )
 
     @user_aggregator.event_handler("on_user_turn_started")
     async def on_user_turn_started(_aggregator, strategy):
         # A transcription can arrive after the VAD turn has stopped. It must
         # not start a new controller turn and discard the final transcript.
-        if controller_options and not isinstance(strategy, VADUserTurnStartStrategy):
+        if controller_options and isinstance(strategy, TranscriptionUserTurnStartStrategy):
             await controller.handle_native_turn_started(transcription_only=True)
-        elif isinstance(strategy, VADUserTurnStartStrategy):
+        else:
             await controller.handle_native_turn_started()
 
     @user_aggregator.event_handler("on_user_turn_stopped")
     async def on_user_turn_stopped(_aggregator, _strategy, _message):
         await controller.handle_native_turn_stopped(_message.content)
-    stt = DeepgramSTTService(
-        api_key=runtime.deepgram_api_key,
-        settings=DeepgramSTTService.Settings(
-            model=runtime.stt_model,
-            language=runtime.stt_language,
-            interim_results=True,
-            endpointing=runtime.deepgram_endpointing_ms,
-            punctuate=True,
-            smart_format=False,
-            keyterm=(v2_session.agent.stt_profile.get("keyterms", []) if controller_options else []),
-        ),
-    )
+    keyterms = v2_session.agent.stt_profile.get("keyterms", []) if controller_options else []
+    if use_flux:
+        # `flux-general-multi` accepts language hints rather than the Nova
+        # `language=multi` query value.  Goodbox currently serves English and
+        # Hindi callers, so preserve that multilingual intent explicitly.
+        language_hints = [Language.EN, Language.HI] if runtime.stt_language == "multi" else None
+        stt = OrderedFluxSTTService(
+            api_key=runtime.deepgram_api_key,
+            settings=DeepgramFluxSTTService.Settings(
+                model=runtime.stt_model,
+                language_hints=language_hints,
+                eager_eot_threshold=float(os.getenv("V2_FLUX_EAGER_EOT_THRESHOLD", "0.55")),
+                eot_threshold=float(os.getenv("V2_FLUX_EOT_THRESHOLD", "0.70")),
+                eot_timeout_ms=int(os.getenv("V2_FLUX_EOT_TIMEOUT_MS", "3000")),
+                keyterm=keyterms,
+            ),
+        )
+    else:
+        stt = DeepgramSTTService(
+            api_key=runtime.deepgram_api_key,
+            settings=DeepgramSTTService.Settings(
+                model=runtime.stt_model,
+                language=runtime.stt_language,
+                interim_results=True,
+                endpointing=runtime.deepgram_endpointing_ms,
+                punctuate=True,
+                smart_format=False,
+                keyterm=keyterms,
+            ),
+        )
     tts_settings = CartesiaTTSService.Settings(
         voice=runtime.cartesia_voice_id,
         model=runtime.cartesia_model,

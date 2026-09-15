@@ -19,10 +19,15 @@ target.
 The V2 WebSocket adapter uses Cartesia's header-based authentication and an
 IPv4 provider connection. This avoids the current host's stalled IPv6
 CloudFront route while keeping the API key out of connection URLs and logs.
-Finalized STT turns have no artificial settle delay; unfinalized fragments use
-`V2_TURN_SETTLE_SECS` (default `0`). Both are included in reported EOT latency.
-Only VAD-confirmed starts cancel stale generation; late transcription starts do
-not overwrite or interrupt an in-flight turn.
+Goodbox's `flux` alias resolves to Deepgram `flux-general-multi`. Flux owns
+start/EOT detection through `ExternalUserTurnStrategies`, with EagerEOT feeding
+the existing private speculation path; it is never combined with local
+Silero/SmartTurn ownership. Finalized Flux turns have no artificial settle
+delay. Nova fallback turns use `V2_TURN_SETTLE_SECS` (default `0.18`) so a
+trailing final transcript replaces a provisional aggregate rather than creating
+a duplicate response. A transcription-only start is initially treated as
+untrusted, but meaningful subsequent STT text confirms it as a barge-in and
+flushes queued bot audio before the next answer starts.
 For low-risk, no-tool response plans, `ENABLE_SPEC_TTS=true` warms a second,
 private Cartesia WebSocket at call start. Interim LLM audio is retained locally
 until hard EOT validates the exact response fingerprint; then a capped PCM
@@ -57,6 +62,29 @@ and observability primitives.
 Read [the execution plan](EXECUTION_PLAN.md) before enabling runtime flags.
 
 ## Verify
+
+### Flux correctness and timing update
+
+Flux preserves the native `UserStoppedSpeakingFrame` so Pipecat's controller
+and strategy both leave the speaking state. `FluxStopStrategy` checks for
+completion immediately when final text arrives, supporting either arrival
+order without the external strategy's 500 ms fallback wait. The aggregator's full text is
+authoritative; individual final segments no longer replace it.
+
+Latency starts at receipt of Flux EndOfTurn, and each response logs
+`provider-turn` and `provider-EOT->aggregator`. Compare new summaries with
+provider EOT timestamps, not the older aggregator-based summaries.
+
+Only Flux EagerEndOfTurn prepares speculative work. TurnResumed invalidates
+the private candidate, and reuse requires an exact normalized transcript plus
+the existing plan fingerprint. This can reduce hit rate while preventing
+changed suffixes from reusing an obsolete answer.
+
+Callback time variants (including `p.m.`) use the local preference route.
+Hosted output passes through a sentence-level booking-claim guard before TTS;
+this adds sentence buffering but prevents split-token booking claims from
+being spoken. No scheduling service is connected. Live latency and recognition
+quality still require a new call; unit tests do not establish a latency SLO.
 
 ```bash
 # Use Python 3.10+ (the workspace's ../.venv313/bin/python is suitable).

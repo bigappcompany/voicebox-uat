@@ -150,22 +150,16 @@ def _runtime_from_goodbox(data: dict[str, Any]) -> AgentRuntimeConfig:
 
     primary_language = str(data.get("primary_language") or "").upper()
     stt_language = "multi" if primary_language in {"", "ENGLISH", "HINDI"} else "multi"
-    requested_stt_model = str(transcriber.get("model") or "nova-3").strip()
-    # Goodbox currently returns the generic alias "flux". V1 uses Deepgram's
-    # Nova /v1/listen service and local Smart Turn detection; sending a Flux
-    # model name to that endpoint makes Deepgram reject the WebSocket with 400.
-    # Keep V1 on its original turn architecture and use the supported Nova-3
-    # multilingual model for this Goodbox alias.
+    requested_stt_model = str(transcriber.get("model") or "flux").strip()
+    # Goodbox uses the short `flux` alias.  The V2 adapter uses the dedicated
+    # Deepgram Flux /v2/listen service, where the explicit multilingual model
+    # is required; unlike Nova it also supplies the native turn boundaries.
     stt_model = (
-        "nova-3" if requested_stt_model.lower().startswith("flux") else requested_stt_model
+        "flux-general-multi"
+        if requested_stt_model.lower() in {"flux", "flux-general", "flux-general-multi"}
+        else requested_stt_model
     )
-    if stt_model != requested_stt_model:
-        logger.warning(
-            "Goodbox requested STT model {!r}; V1 is using {!r} with its "
-            "Nova /v1/listen pipeline",
-            requested_stt_model,
-            stt_model,
-        )
+    logger.info("Goodbox STT requested={!r}; V2 runtime model={!r}", requested_stt_model, stt_model)
     voice_id = str(synthesizer.get("voice_id") or os.getenv("CARTESIA_VOICE_ID", "")).strip()
     if not voice_id:
         raise ValueError("Goodbox synthesizer_config.voice_id or CARTESIA_VOICE_ID is required")

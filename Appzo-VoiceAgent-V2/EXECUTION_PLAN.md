@@ -17,9 +17,10 @@ audible HTTP emergency fallback. Private speculative Cartesia PCM is enabled
 only on the healthy WebSocket path and only for low-risk, no-tool plans.
 The deployed adapter uses header authentication and IPv4 for Cartesia WSS,
 matching the verified server-side provider route.
-Flux, regional ingress, and self-hosted Gemma remain provider/deployment
-experiments; they cannot be safely enabled without their credentials,
-recorded-call evaluation corpus, and production infrastructure.
+Goodbox's Flux configuration is now deployed as `flux-general-multi` with
+Flux-owned external turn strategies and EagerEOT feeding the guarded
+speculation path. Regional ingress and self-hosted Gemma remain
+provider/deployment experiments.
 
 ## Execution sequence
 
@@ -72,8 +73,8 @@ copied `main.py`/`goodbox_server.py` entrypoint.
 ## Next operational work
 
 Capture representative English/Hindi/Hinglish telephony calls before setting
-numeric SLOs. Use `scripts/record_baseline.py` to write a versioned baseline,
-then attach actual Pipecat/Deepgram/Cartesia adapters to `LatencyController`
-behind the supplied flags. Do not enable Flux together with local turn-stop
-ownership, and do not promote a local model until it passes the same bundle,
-retrieval, policy, and slot evaluation corpus as the hosted model.
+numeric SLOs. Use `scripts/record_baseline.py` to write a versioned baseline.
+Flux is active with external turn ownership; do not add local SmartTurn or VAD
+turn-stop ownership to that path. Do not promote a local model until it passes
+the same bundle, retrieval, policy, and slot evaluation corpus as the hosted
+model.

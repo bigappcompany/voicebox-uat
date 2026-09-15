@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from voice_agent.agents.bundle import AgentBundle
 from voice_agent.agents.compiler import AgentCompiler
@@ -58,6 +59,21 @@ class V2RuntimeTests(unittest.TestCase):
         self.assertTrue(flags.enable_agent_bundle)
         self.assertFalse(flags.enable_spec_tts)
         self.assertFalse(flags.enable_flux)
+
+    def test_goodbox_flux_alias_uses_the_v2_multilingual_flux_model(self):
+        from goodbox_server import _runtime_from_goodbox
+
+        config = {
+            "model_config": {"provider": "azure", "model": "gpt-4.1-mini"},
+            "transcriber_config": {"provider": "deepgram", "model": "flux"},
+            "synthesizer_config": {"provider": "cartesia", "voice_id": "voice"},
+            "call_agent": {},
+        }
+        with patch("goodbox_server._required", return_value="test-key"), patch(
+            "goodbox_server._shared_llm_client", return_value=object()
+        ):
+            runtime = _runtime_from_goodbox(config)
+        self.assertEqual(runtime.stt_model, "flux-general-multi")
 
     def test_index_cannot_return_another_tenant_document(self):
         index = TenantKnowledgeIndex(); index.add(KnowledgeRecord("tenant-b", "agent", "v2", "secret", "private rate"))
