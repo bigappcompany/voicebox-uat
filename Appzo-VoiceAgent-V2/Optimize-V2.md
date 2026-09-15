@@ -11,7 +11,7 @@
 
 ## 0. Executive Summary
 
-The current system is already more advanced than a stock STT → LLM → TTS voice agent: it uses Pipecat for transport/turn orchestration, Deepgram Nova-3 for streaming STT, a custom `StreamingFAQController` for speculative LLM calls, GPT-4.1-mini, Cartesia, and Plivo. Goodbox acts primarily as a control plane that supplies prompt/configuration at call startup and receives the transcript at call end.
+The current system is already more advanced than a stock STT → LLM → TTS voice agent: it uses Pipecat for transport/turn orchestration, Deepgram Nova-3 for streaming STT, a custom voice controller for hosted LLM calls, GPT-4.1-mini, Cartesia, and Plivo. Goodbox acts primarily as a control plane that supplies prompt/configuration at call startup and receives the transcript at call end.
 
 Optimize V2 should **not** be built as “a faster prompt” or “a faster model swap.” It should be built as a **multi-tenant real-time agent runtime** with six core principles:
 
@@ -2859,4 +2859,3 @@ speculation:
 8. A faster but less correct route is not an optimization.
 9. “First audio” is not sufficient; measure first meaningful audio.
 10. Prefer Pipecat’s native primitives where they already provide the needed lifecycle semantics.
-

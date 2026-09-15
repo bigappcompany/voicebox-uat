@@ -16,7 +16,8 @@ class FlowEngine:
         transitions = state.get("transitions") or state.get("allowed_transitions") or {}
         target = transitions.get(intent, current_state)
         actions = state.get("actions") or {}
-        return FlowResult(str(target), slots, str(actions.get(intent, "continue")))
+        updates = (state.get("slot_updates") or {}).get(intent, {})
+        return FlowResult(str(target), dict(updates), str(actions.get(intent, "continue")))
 
     def plan(self, flow: dict, current_state: str, intent: str, slots: dict[str, str], *, risk_class: str = "LOW_PUBLIC") -> ResponsePlan:
         result = self.transition(flow, current_state, intent, slots)

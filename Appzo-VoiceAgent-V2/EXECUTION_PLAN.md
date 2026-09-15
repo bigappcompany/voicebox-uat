@@ -6,14 +6,20 @@ V2 is a staged migration, not a replacement of the known-working Plivo/Pipecat
 call path. This delivery implements the offline/runtime foundation through
 phases 1–5, 7–10 and the safety gates needed to run them: compiled tenant
 bundles, local tenant-scoped retrieval, flow/slot control, route selection,
-semantic speculation validation, safe text chunking, two-phase speculative
-audio, metrics, flags, and provider-client reuse. The copied V1 service remains
-the rollback path while V2 is evaluated in shadow mode.
+semantic speculation validation, safe text chunking, direct Cartesia WebSocket
+streaming, two-phase speculative audio, metrics, flags, and provider-client
+reuse. The copied V1 service remains the rollback path while V2 is evaluated
+in shadow mode.
 
-Provider-dependent experiments (Flux, Cartesia buffering, regional ingress,
-and self-hosted Gemma) are deliberately not enabled without credentials,
-recorded calls, and production infrastructure. Their harness contracts and
-flags are included so they can be measured rather than guessed.
+The runtime uses `V2_TTS_TRANSPORT=auto`: it selects direct Cartesia WebSocket
+streaming only after a call-start handshake succeeds, otherwise it uses the
+audible HTTP emergency fallback. Private speculative Cartesia PCM is enabled
+only on the healthy WebSocket path and only for low-risk, no-tool plans.
+The deployed adapter uses header authentication and IPv4 for Cartesia WSS,
+matching the verified server-side provider route.
+Flux, regional ingress, and self-hosted Gemma remain provider/deployment
+experiments; they cannot be safely enabled without their credentials,
+recorded-call evaluation corpus, and production infrastructure.
 
 ## Execution sequence
 

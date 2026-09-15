@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from typing import Any
 
 from ..agents.bundle import AgentBundle
 
@@ -11,6 +12,9 @@ class CallSession:
     state: dict[str, object] = field(default_factory=dict)
     slots: dict[str, object] = field(default_factory=dict)
     history: list[dict[str, str]] = field(default_factory=list)
+    # Built only at call setup. The V2 media path never fetches Goodbox or a
+    # remote vector store after caller EOT.
+    knowledge_index: Any | None = None
     turn_id: int = 0
 
     def __post_init__(self) -> None:

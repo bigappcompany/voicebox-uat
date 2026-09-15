@@ -2,12 +2,12 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from main import StreamingFAQController
+from main import StreamingVoiceController
 
 
 class RecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.controller = StreamingFAQController("test", client=AsyncMock())
+        self.controller = StreamingVoiceController("test", client=AsyncMock(), system_prompt="test")
         self.controller._speak_fixed = AsyncMock()
         self.controller._run_llm = AsyncMock()
         await self.controller._start_turn()

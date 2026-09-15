@@ -6,6 +6,7 @@ webhook that Goodbox's Plivo number reaches after a call is placed.
 """
 
 import base64
+import hashlib
 import os
 from dataclasses import dataclass, field
 from typing import Any
@@ -31,6 +32,7 @@ from pipecat.transports.websocket.fastapi import (
 
 CALL_START_PATH = "/voice-calls/call-start"
 CALL_STOP_PATH = "/voice-calls/call-stop"
+_LLM_CLIENTS: dict[tuple[str, str, str], object] = {}
 
 
 def _required(name: str) -> str:
@@ -91,6 +93,27 @@ refusal text after `OK|`.
 """
 
 
+def _shared_llm_client(provider: str, endpoint: str, api_key: str) -> object:
+    """Reuse HTTP/TLS connections without making credentials part of the key."""
+    key_id = hashlib.sha256(api_key.encode()).hexdigest()
+    key = (provider, endpoint, key_id)
+    existing = _LLM_CLIENTS.get(key)
+    if existing is not None:
+        return existing
+    if provider == "azure":
+        client = AsyncAzureOpenAI(
+            api_key=api_key,
+            azure_endpoint=endpoint,
+            api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21"),
+        )
+    elif provider == "groq":
+        client = AsyncOpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
+    else:
+        client = AsyncOpenAI(api_key=api_key)
+    _LLM_CLIENTS[key] = client
+    return client
+
+
 def _runtime_from_goodbox(data: dict[str, Any]) -> AgentRuntimeConfig:
     model_config = data.get("model_config") or {}
     transcriber = data.get("transcriber_config") or {}
@@ -112,18 +135,15 @@ def _runtime_from_goodbox(data: dict[str, Any]) -> AgentRuntimeConfig:
     if llm_provider == "azure":
         resource = _required("AZURE_LLM_RESOURCE_NAME")
         llm_key = _required("AZURE_LLM_API_KEY")
-        llm_client = AsyncAzureOpenAI(
-            api_key=llm_key,
-            azure_endpoint=f"https://{resource}.openai.azure.com",
-            api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21"),
-        )
+        llm_client = _shared_llm_client("azure", f"https://{resource}.openai.azure.com", llm_key)
     elif llm_provider in {"groq", "openai"}:
         # Retain an escape hatch for the existing browser-test providers.
         env_key = "GROQ_API_KEY" if llm_provider == "groq" else "OPENAI_API_KEY"
         llm_key = _required(env_key)
-        llm_client = AsyncOpenAI(
-            api_key=llm_key,
-            base_url=("https://api.groq.com/openai/v1" if llm_provider == "groq" else None),
+        llm_client = _shared_llm_client(
+            llm_provider,
+            "https://api.groq.com/openai/v1" if llm_provider == "groq" else "https://api.openai.com/v1",
+            llm_key,
         )
     else:
         raise ValueError(f"Unsupported Goodbox LLM provider: {llm_provider!r}")
@@ -170,8 +190,8 @@ def _runtime_from_goodbox(data: dict[str, Any]) -> AgentRuntimeConfig:
         vad_stop_secs=_float(os.getenv("V2_VAD_STOP_SECS", "0.2"), 0.2, 0.05, 3.0),
         vad_min_volume=_float(agent.get("min_volume"), 0.6, 0.0, 1.0),
         intro_message=str(agent.get("intro_message") or "").strip() or None,
-        enforce_apple_scope=False,
         llm_client=llm_client,
+        owns_llm_client=False,
         refusal_message=refusal,
         operational_error_message="Sorry, I couldn't process that request just now. Please try again.",
     )
@@ -324,6 +344,7 @@ async def plivo_media(websocket: WebSocket, body: str = Query("")) -> None:
                     transport,
                     runtime_config=_runtime_from_goodbox(config),
                     transcript_callback=transcript.add,
+                    v2_session=v2_controller.session,
                 )
             finally:
                 # Goodbox receives all completed user/assistant turns even when

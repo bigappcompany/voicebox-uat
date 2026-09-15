@@ -17,4 +17,8 @@ class TenantKnowledgeIndex:
     def search(self, *, tenant_id: str, agent_id: str, knowledge_version: str, query: str, top_k: int = 3) -> list[KnowledgeRecord]:
         words = set(re.findall(r"\w+", query.lower()))
         records = self._records.get((tenant_id, agent_id, knowledge_version), [])
-        return sorted(records, key=lambda r: len(words & set(re.findall(r"\w+", r.text.lower()))), reverse=True)[:top_k]
+        ranked = [
+            (len(words & set(re.findall(r"\w+", record.text.lower()))), record)
+            for record in records
+        ]
+        return [record for score, record in sorted(ranked, key=lambda item: item[0], reverse=True)[:top_k] if score]

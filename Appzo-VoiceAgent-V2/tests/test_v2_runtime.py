@@ -12,6 +12,8 @@ from voice_agent.runtime.bootstrap import RuntimeBootstrap
 from voice_agent.runtime.flags import RuntimeFlags
 from voice_agent.speech.audio_commit import AudioCommitter, SpeculativeAudioCandidate
 from voice_agent.speech.safe_chunker import SafeSpeechChunker
+from voice_agent.flows.slots import SlotValidator
+from voice_agent.flows.engine import FlowEngine
 
 
 def bundle(*, risk="LOW_PUBLIC"):
@@ -22,6 +24,26 @@ class V2RuntimeTests(unittest.TestCase):
     def test_goodbox_compiler_emits_immutable_runtime_bundle(self):
         compiled = AgentCompiler().compile_goodbox({"chatbot_id": "a", "tenant_id": "t", "prompt": "hello", "call_agent": {}})
         self.assertEqual((compiled.agent_id, compiled.tenant_id, compiled.invariant_prompt), ("a", "t", "hello"))
+        self.assertEqual(compiled.identity["company_name"], "The Hiring Company")
+
+    def test_call_start_compiles_and_namespaces_goodbox_knowledge(self):
+        async def run():
+            bootstrap = RuntimeBootstrap(AgentBundleRegistry(), AgentCompiler())
+            runtime = await bootstrap.start_call(
+                {"call_id": "c"},
+                {
+                    "chatbot_id": "a",
+                    "tenant_id": "t",
+                    "knowledge_documents": [{"id": "fees", "content": "Contract staffing fees depend on the role."}],
+                },
+            )
+            return runtime.session
+        import asyncio
+        session = asyncio.run(run())
+        records = session.knowledge_index.search(
+            tenant_id="t", agent_id="a", knowledge_version=session.agent.knowledge_version, query="contract fees"
+        )
+        self.assertEqual([record.document_id for record in records], ["fees"])
 
     def test_bootstrap_compiles_once_at_call_start(self):
         async def run():
@@ -71,6 +93,22 @@ class V2RuntimeTests(unittest.TestCase):
         agent = bundle(); agent = AgentBundle(**{**agent.__dict__, "actions": {"ASK": {}}, "flow_graph": {"huge": "ignored"}})
         messages = PromptBuilder(max_knowledge_chars=10).build(agent=agent, state={"name": "OPEN"}, slots={}, route=ResponsePlan("llm"), knowledge=["x" * 50], history=[], user_text="hello")
         self.assertEqual(messages[-1]["content"], "hello"); self.assertLessEqual(len(messages[1]["content"]), len("RELEVANT KNOWLEDGE:\n") + 10)
+
+    def test_slot_validator_enforces_compiled_type_bounds_and_enums(self):
+        validator = SlotValidator()
+        self.assertEqual(validator.validate({"type": "integer", "minimum": 2}, "4").value, 4)
+        self.assertFalse(validator.validate({"type": "integer", "minimum": 2}, "one").valid)
+        self.assertFalse(validator.validate({"enum": ["yes", "no"]}, "maybe").valid)
+
+    def test_flow_plan_keeps_state_transition_and_slot_update_deterministic(self):
+        plan = FlowEngine().plan(
+            {"states": {"OPEN": {"transitions": {"qualified": "REQUIREMENTS"}, "actions": {"qualified": "continue"}, "slot_updates": {"qualified": {"qualified": "yes"}}}}},
+            "OPEN",
+            "qualified",
+            {},
+            risk_class="LOW_WORKFLOW",
+        )
+        self.assertEqual((plan.next_state, plan.slots_written), ("REQUIREMENTS", {"qualified": "yes"}))
 
 
 if __name__ == "__main__": unittest.main()
