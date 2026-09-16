@@ -7,12 +7,19 @@ from .bundle import AgentBundle
 class AgentBundleRegistry:
     def __init__(self, loader: Callable[[str], Awaitable[AgentBundle]] | None = None) -> None:
         self._bundles: dict[tuple[str, str], AgentBundle] = {}
+        self._source_bundles: dict[str, AgentBundle] = {}
         self._loader = loader
         self._lock = asyncio.Lock()
 
-    async def put(self, bundle: AgentBundle) -> None:
+    async def put(self, bundle: AgentBundle, *, source_digest: str | None = None) -> None:
         async with self._lock:
             self._bundles[(bundle.agent_id, bundle.version)] = bundle
+            if source_digest:
+                self._source_bundles[source_digest] = bundle
+
+    async def get_by_source(self, source_digest: str) -> AgentBundle | None:
+        async with self._lock:
+            return self._source_bundles.get(source_digest)
 
     async def get(self, agent_id: str, version: str | None = None) -> AgentBundle:
         async with self._lock:

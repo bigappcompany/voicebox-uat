@@ -1,5 +1,9 @@
 # Appzo VoiceAgent V2
 
+The current rollout is documented in
+[IMPROVEMENTS_EXECUTION_PLAN.md](IMPROVEMENTS_EXECUTION_PLAN.md); the source
+design is [improvements.md](improvements.md).
+
 ## Live routing
 
 `goodbox_server.py` enables V2 routing by default. Restart the server and look
@@ -20,8 +24,9 @@ The V2 WebSocket adapter uses Cartesia's header-based authentication and an
 IPv4 provider connection. This avoids the current host's stalled IPv6
 CloudFront route while keeping the API key out of connection URLs and logs.
 Goodbox's `flux` alias resolves to Deepgram `flux-general-multi`. Flux owns
-start/EOT detection through `ExternalUserTurnStrategies`, with EagerEOT feeding
-the existing private speculation path; it is never combined with local
+start/EOT detection through `ExternalUserTurnStrategies`. A stable interim can
+start private LLM work before EagerEOT; EagerEOT raises confidence, while only
+final Flux EOT may make a validated result audible. Flux is never combined with local
 Silero/SmartTurn ownership. Finalized Flux turns have no artificial settle
 delay. Nova fallback turns use `V2_TURN_SETTLE_SECS` (default `0.18`) so a
 trailing final transcript replaces a provisional aggregate rather than creating
@@ -34,6 +39,17 @@ until hard EOT validates the exact response fingerprint; then a capped PCM
 prefix is released before normal Cartesia synthesis continues. A mismatch,
 barge-in, high-risk plan, tool dependency, or failed private socket discards it
 and falls back to the normal public WebSocket stream.
+
+Known greetings are stored persistently as Plivo-native 8 kHz μ-law under
+`.runtime-cache/greetings`. The first call for a new text/voice/version captures
+the normal TTS greeting; subsequent calls play the cached asset while the live
+pipeline warms. Caller speech cancels it with `clearAudio`.
+
+All improvements default on. Set `ENABLE_V2_IMPROVEMENTS=false` to disable
+them as a group. Individual rollback flags are listed in the improvement
+execution plan. The default Flux profile is `fast`; use
+`V2_FLUX_ENDPOINT_PROFILE=balanced` while evaluating false cuts for slower
+speech.
 
 Set `V2_COMPANY_NAME` to the approved tenant name to enforce a consistent
 identity and enable exact identity-question responses. Simple time preferences
@@ -75,22 +91,33 @@ Latency starts at receipt of Flux EndOfTurn, and each response logs
 `provider-turn` and `provider-EOT->aggregator`. Compare new summaries with
 provider EOT timestamps, not the older aggregator-based summaries.
 
-Only Flux EagerEndOfTurn prepares speculative work. TurnResumed invalidates
-the private candidate, and reuse requires an exact normalized transcript plus
-the existing plan fingerprint. This can reduce hit rate while preventing
-changed suffixes from reusing an obsolete answer.
+Every completed response also logs an additive `LATENCY BREAKDOWN`. When a
+local last-voiced timestamp is available it covers caller speech-stop through
+first audible output; otherwise it starts at hard EOT. Each non-overlapping
+part has a stable key and an owner (`setting`, `service`, `bot`, or `pipeline`),
+and the same structured list is stored under `latency_breakdown` in the JSON
+`LATENCY RECORD`. The parts always sum to the reported total. Set
+`V2_LATENCY_BREAKDOWN_MIN_MS` (default `1`) to roll briefer parts into one
+pipeline line in the human-readable view without changing the JSON detail.
 
-Callback time variants (including `p.m.`) use the local preference route.
-Hosted output passes through a sentence-level booking-claim guard before TTS;
-this adds sentence buffering but prevents split-token booking claims from
-being spoken. No scheduling service is connected. Live latency and recognition
-quality still require a new call; unit tests do not establish a latency SLO.
+Stable Flux interims and EagerEndOfTurn can prepare private speculative work.
+TurnResumed invalidates it. Classified routes may reuse a response only when
+the tenant/state/intent/knowledge/material-slot fingerprint matches;
+unclassified hosted turns still require exact normalized text.
+
+Callback time variants (including `p.m.`) use a local preference state machine.
+Only booking-sensitive hosted output uses the sentence-level booking-claim
+guard; ordinary hosted output streams directly. No scheduling service is
+connected. Live latency and recognition quality still require representative
+calls; unit tests do not establish a latency SLO.
 
 ```bash
 # Use Python 3.10+ (the workspace's ../.venv313/bin/python is suitable).
 python -m unittest discover -s tests -v
 python -m compileall -q voice_agent scripts
 python scripts/verify_cartesia_ws.py
+# After representative calls, this accepts either raw JSONL or server logs:
+python scripts/record_baseline.py path/to/server.log
 ```
 
 ## Existing call path
@@ -98,3 +125,32 @@ python scripts/verify_cartesia_ws.py
 Set the same environment values used by V1, then run `goodbox_server.py` and
 `scripts/dial_goodbox_test.py`. Do not turn on speculative audio for regulated
 or tool-dependent flows; the V2 controller enforces this again at commit time.
+# Low-latency call validation
+
+The V2 Goodbox path uses dynamic Deepgram Flux profiles. The default fast
+profile is `eager=0.35`, `eot=0.55`, `timeout=1200ms`; the runtime switches to
+shorter yes/no and entity profiles based on the question the bot asks.
+
+Capture a call and generate the layered report:
+
+```bash
+mkdir -p logs
+python3 goodbox_server.py 2>&1 | tee logs/call.log
+```
+
+After the call finishes, run in another terminal (or after stopping the
+server):
+
+```bash
+python3 scripts/record_baseline.py logs/call.log
+```
+
+After at least 50 fully measured turns, make the latency targets enforceable:
+
+```bash
+python3 scripts/record_baseline.py logs/call.log --enforce-targets --min-samples 50
+```
+
+The report separates true `last_voiced_audio -> first_audible` measurements
+from `hard_eot -> first_audible` fallbacks. `AUDIO CADENCE` records report
+whole-utterance packet gaps to diagnose broken or word-by-word playback.

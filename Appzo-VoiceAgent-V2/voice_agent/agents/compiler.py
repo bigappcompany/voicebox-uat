@@ -1,10 +1,18 @@
 """Compilation boundary between authoring payloads and small runtime artifacts."""
+import hashlib
+import json
 from typing import Any
 
 from .bundle import AgentBundle
 
 
 class AgentCompiler:
+    @staticmethod
+    def source_digest(payload: dict[str, Any]) -> str:
+        """Stable cache key for an immutable Goodbox authoring snapshot."""
+        encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode()).hexdigest()
+
     def compile_goodbox(self, payload: dict[str, Any]) -> AgentBundle:
         agent = payload.get("call_agent") or {}
         model = payload.get("model_config") or {}
@@ -20,6 +28,15 @@ class AgentCompiler:
         system = "\n\n".join(part for part in prompt_parts if part)
         if not system:
             system = "You are a concise, helpful telephone voice assistant."
+        runtime_prompt = payload.get("runtime_prompt") or agent.get("runtime_prompt") or {}
+        if isinstance(runtime_prompt, str):
+            runtime_prompt = {"invariant": runtime_prompt}
+        fact_profile = payload.get("fact_profile") or agent.get("fact_profile") or {}
+        if not isinstance(fact_profile, dict):
+            fact_profile = {}
+        profile_name = str(fact_profile.get("name") or payload.get("runtime_profile") or agent.get("runtime_profile") or "").strip()
+        if profile_name:
+            fact_profile = {**fact_profile, "name": profile_name}
         raw_knowledge = (
             payload.get("knowledge_profile")
             or payload.get("knowledge_documents")
@@ -50,6 +67,9 @@ class AgentCompiler:
             tts_profile={"model": synthesizer.get("model", "sonic-3.5"), "voice_id": synthesizer.get("voice_id")},
             knowledge_profile=knowledge_profile,
             cached_utterances=(agent.get("cached_utterances") or payload.get("cached_utterances") or {}),
+            compiled_prompt=dict(runtime_prompt),
+            fact_profile=fact_profile,
+            cache_policy=dict(payload.get("cache_policy") or agent.get("cache_policy") or {}),
         )
 
     @staticmethod

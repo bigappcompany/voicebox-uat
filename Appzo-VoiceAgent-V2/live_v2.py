@@ -29,14 +29,18 @@ from main import LLMRequest, StreamingVoiceController, normalize
 from voice_agent.llm.prompt_builder import PromptBuilder
 from voice_agent.flows.engine import FlowEngine
 from voice_agent.flows.slots import SlotValidator
+from voice_agent.flows.facts import FactExtractor
+from voice_agent.flows.callbacks import CallbackCoordinator
 from voice_agent.routing.deterministic import DeterministicRouter
 from voice_agent.runtime.fingerprints import ResponseFingerprint
+from voice_agent.runtime.flags import RuntimeFlags
 from voice_agent.runtime.response_plan import ResponsePlan
 from voice_agent.speech.safe_chunker import SafeSpeechChunker
 from voice_agent.speech.speculative_cartesia import SpeculativeCartesiaBuffer
 from voice_agent.speech.stream_filter import SpeechStreamFilter
 from voice_agent.speech.booking_guard import BookingClaimGuard
 from voice_agent.turns.transcript_stability import TranscriptStabilityAnalyzer
+from voice_agent.turns.endpoint_profiles import profile_for_prompt
 
 
 class V2RoutingController(StreamingVoiceController):
@@ -54,13 +58,17 @@ class V2RoutingController(StreamingVoiceController):
     ):
         super().__init__(*args, **kwargs)
         self.session = session
+        self.flags = RuntimeFlags.from_env()
         self._flux_mode = flux_mode
         self._flux_eager = False
         self._closed_flux_turns = set()
-        self.router = DeterministicRouter()
+        self.router = DeterministicRouter(extended=self.flags.enable_extended_deterministic_routing)
         self.flow_engine = FlowEngine()
         self.slot_validator = SlotValidator()
-        self.prompt_builder = PromptBuilder()
+        profile_name = str(session.agent.fact_profile.get("name") or os.getenv("V2_FACT_PROFILE", "recruitment"))
+        self.fact_extractor = FactExtractor(session.agent.fact_profile, default_profile=profile_name)
+        self.callback_coordinator = CallbackCoordinator()
+        self.prompt_builder = PromptBuilder(compiled=self.flags.enable_compiled_prompts)
         self._pending_text = ""
         self._latest_finalized_text = ""
         self._settle_task: asyncio.Task | None = None
@@ -87,10 +95,19 @@ class V2RoutingController(StreamingVoiceController):
         self._stability = TranscriptStabilityAnalyzer()
         self._spec_min_words = int(os.getenv("V2_SPECULATION_MIN_WORDS", "3"))
         self._spec_min_chars = int(os.getenv("V2_SPECULATION_MIN_CHARS", "12"))
-        self._spec_commit_wait_secs = float(os.getenv("V2_SPECULATION_COMMIT_WAIT_MS", "80")) / 1000
+        default_commit_wait_ms = "0" if self.flags.enable_zero_delay_spec_promotion else "80"
+        self._spec_commit_wait_secs = float(
+            os.getenv("V2_SPECULATION_COMMIT_WAIT_MS", default_commit_wait_ms)
+        ) / 1000
+        self._stable_interim_secs = float(os.getenv("V2_STABLE_INTERIM_MS", "80")) / 1000
+        self._spec_max_restarts = int(os.getenv("V2_SPECULATION_MAX_RESTARTS", "2"))
         self._safe_chunk_chars = int(os.getenv("V2_SAFE_CHUNK_CHARS", "20"))
         self._safe_chunk_words = int(os.getenv("V2_SAFE_CHUNK_WORDS", "3"))
-        self._enable_spec_tts = os.getenv("ENABLE_SPEC_TTS", "false").lower() == "true"
+        self._safe_chunk_max_wait_ms = int(os.getenv("V2_SAFE_CHUNK_MAX_WAIT_MS", "80"))
+        self._spec_restart_min_new_words = int(os.getenv("V2_SPEC_RESTART_MIN_NEW_WORDS", "3"))
+        self._spec_tts_commit_wait_secs = float(os.getenv("V2_SPEC_TTS_COMMIT_WAIT_MS", "40")) / 1000
+        self._endpoint_profile_updater = None
+        self._enable_spec_tts = self.flags.enable_spec_tts
         self._spec_audio: SpeculativeCartesiaBuffer | None = None
         if self._enable_spec_tts and self._streaming and cartesia_api_key and cartesia_voice_id and cartesia_model:
             self._spec_audio = SpeculativeCartesiaBuffer(
@@ -113,7 +130,11 @@ class V2RoutingController(StreamingVoiceController):
             if isinstance(frame, FluxResumeFrame):
                 await self._invalidate_candidate()
             elif isinstance(frame, InterimTranscriptionFrame):
-                self._flux_eager = (frame.result or {}).get("event") == "EagerEndOfTurn"
+                result = frame.result or {}
+                self._flux_eager = result.get("event") == "EagerEndOfTurn"
+                if self._flux_eager and self._state:
+                    self._state.metrics.eager_eot_at = result.get("runtime_eager_at") or time.perf_counter()
+                    self._state.metrics.eager_eot_confidence = result.get("end_of_turn_confidence")
             elif isinstance(frame, TranscriptionFrame):
                 result = frame.result or {}
                 turn_id = result.get("turn_index")
@@ -124,16 +145,26 @@ class V2RoutingController(StreamingVoiceController):
                 if self._state:
                     self._state.metrics.provider_eot_at = result.get("runtime_eot_at")
                     self._state.metrics.provider_turn_id = turn_id
+                    self._state.metrics.eot_trigger = result.get("trigger")
+                    self._state.metrics.eot_confidence = result.get("end_of_turn_confidence")
+                    self._state.metrics.turn_resumed_count = int(result.get("runtime_turn_resumed_count") or 0)
+                    self._state.metrics.input_gap_count = int(result.get("runtime_input_gap_count") or 0)
+                    self._state.metrics.input_gap_max_ms = float(result.get("runtime_input_gap_max_ms") or 0.0)
         await super().process_frame(frame, direction)
 
     async def _invalidate_candidate(self):
         state = self._state
+        if state:
+            self._cancel_task(state.debounce_task)
         if state and not state.committed and state.candidate:
             self._cancel_task(state.candidate.task)
             await self._abort_spec_audio(state.candidate)
             state.candidate = None
             state.metrics.speculative_started_at = None
+            state.metrics.llm_request_started_at = None
+            state.metrics.llm_stream_opened_at = None
             state.metrics.llm_first_token_at = None
+            state.metrics.first_filtered_text_at = None
             state.metrics.first_safe_text_at = None
 
     async def _on_interim(self, text: str) -> None:
@@ -159,13 +190,45 @@ class V2RoutingController(StreamingVoiceController):
         if not interim:
             return
         state.latest_interim = interim
-        if self._flux_mode and not self._flux_eager:
-            return
         hypothesis = self._stability.update(interim)
-        basis = interim
-        if not self._flux_mode and not hypothesis.stable_prefix:
+        eager = self._flux_mode and self._flux_eager
+        if eager:
+            basis = interim
+        elif self.flags.enable_stable_interim_speculation:
+            basis = hypothesis.stable_prefix
+        else:
             return
         if len(basis) < self._spec_min_chars or len(basis.split()) < self._spec_min_words:
+            return
+
+        if not self._flux_mode:
+            await self._start_candidate(state, interim, source="stable")
+            return
+        if not eager:
+            if state.metrics.stable_interim_at is None:
+                state.metrics.stable_interim_at = hypothesis.stable_since or time.perf_counter()
+            self._cancel_task(state.debounce_task)
+            state.debounce_task = asyncio.create_task(
+                self._start_stable_candidate_after_delay(state, basis, hypothesis.stable_since)
+            )
+            return
+        await self._start_candidate(state, basis, source="eager")
+
+    async def _start_stable_candidate_after_delay(self, state, basis: str, stable_since: float | None) -> None:
+        try:
+            elapsed = max(0.0, time.perf_counter() - (stable_since or time.perf_counter()))
+            await asyncio.sleep(max(0.0, self._stable_interim_secs - elapsed))
+            if self._state is not state or state.committed or state.turn_stopped:
+                return
+            current = self._stability.hypothesis
+            if current.stable_prefix != basis:
+                return
+            await self._start_candidate(state, basis, source="stable")
+        except asyncio.CancelledError:
+            raise
+
+    async def _start_candidate(self, state, basis: str, *, source: str) -> None:
+        if state.speculation_restarts >= self._spec_max_restarts:
             return
 
         if self._spec_audio:
@@ -174,20 +237,39 @@ class V2RoutingController(StreamingVoiceController):
         if old and old.transcript == basis and (
             old.completed or (old.task is not None and not old.task.done())
         ):
+            if source == "eager":
+                old.v2_source = "eager"
+                await self._start_existing_spec_audio(state, old)
             return
+        if old and old.task is not None and not old.task.done() and basis.startswith(old.transcript + " "):
+            new_words = len(basis.split()) - len(old.transcript.split())
+            if source != "eager" and new_words < self._spec_restart_min_new_words:
+                return
         self._cancel_task(old.task if old else None)
         await self._abort_spec_audio(old)
+        provisional = self.fact_extractor.extract(basis, self.session.slots) if self.flags.enable_structured_facts else None
+        provisional_slots = {**self.session.slots, **(provisional.values if provisional else {})}
         plan, speech = self._response_plan(basis)
+        if provisional_slots:
+            plan = replace(plan, material_slots=tuple(sorted(provisional_slots)))
         if speech is not None or plan.risk_class not in {"LOW_PUBLIC", "LOW_WORKFLOW"} or plan.tool_name:
             return
 
         candidate = LLMRequest(basis, speculative=True)
         candidate.v2_plan = plan
-        candidate.v2_fingerprint = self._fingerprint(basis, plan)
+        candidate.v2_slots = provisional_slots
+        candidate.v2_source = source
+        candidate.v2_fingerprint = self._fingerprint(basis, plan, slots=provisional_slots)
         state.candidate = candidate
+        state.speculation_restarts += 1
         state.metrics.speculative_started_at = time.perf_counter()
+        state.metrics.llm_request_started_at = None
+        state.metrics.llm_stream_opened_at = None
+        state.metrics.llm_first_token_at = None
+        state.metrics.first_filtered_text_at = None
+        state.metrics.first_safe_text_at = None
         candidate.task = asyncio.create_task(self._generate(state, basis, plan, request=candidate))
-        logger.debug("V2 SOFT-EOT turn={} stable_words={} route={}", state.turn_id, len(basis.split()), plan.route)
+        logger.debug("V2 SPEC START turn={} source={} stable_words={} route={}", state.turn_id, source, len(basis.split()), plan.route)
 
     async def _on_final_transcript(self, text: str) -> None:
         # Pipecat's universal aggregator normally supplies the complete
@@ -210,8 +292,12 @@ class V2RoutingController(StreamingVoiceController):
                 self._transcription_barge_in_pending = True
                 self._transcription_barge_in_turn_id = self._state.turn_id
             return
+        greeting_interrupt = getattr(self, "_greeting_interrupt", None)
+        if greeting_interrupt is not None:
+            await greeting_interrupt()
         self._transcription_barge_in_pending = False
         self._transcription_barge_in_turn_id = None
+        self._flux_eager = False
         self._mark_prior_playback_interrupted()
         if self._settle_task and not self._settle_task.done():
             self._settle_task.cancel()
@@ -292,21 +378,24 @@ class V2RoutingController(StreamingVoiceController):
             state.metrics.turn_committed_at = self._native_stop_at
         self.session.turn_id = state.turn_id
         text = state.final_transcript
+        if self.flags.enable_structured_facts:
+            facts = self.fact_extractor.extract(text, self.session.slots)
+            self.session.slots.update(facts.values)
+            if facts.corrected:
+                logger.info("V2 FACT correction fields={}", ",".join(facts.corrected))
         if self._transcript_callback:
             self._transcript_callback("user", text)
 
         plan, speech = self._response_plan(text)
         candidate = state.candidate
         if self._candidate_matches(candidate, text, plan):
-            try:
-                if candidate.task and not candidate.task.done() and not candidate.answer_chunks:
-                    await asyncio.wait_for(asyncio.shield(candidate.task), timeout=self._spec_commit_wait_secs)
-            except TimeoutError:
-                # The final route/fingerprint is already valid. We can make
-                # this task public without making it audible; its next safe
-                # phrase will be emitted normally. Waiting for a full phrase
-                # here would throw away the interim LLM head start.
-                pass
+            state.metrics.candidate_validated_at = time.perf_counter()
+            if not self.flags.enable_zero_delay_spec_promotion and self._spec_commit_wait_secs > 0:
+                try:
+                    if candidate.task and not candidate.task.done() and not candidate.answer_chunks:
+                        await asyncio.wait_for(asyncio.shield(candidate.task), timeout=self._spec_commit_wait_secs)
+                except TimeoutError:
+                    pass
             if self._state is not state:
                 return
             # A completed task that produced no safe text failed upstream, so
@@ -320,6 +409,7 @@ class V2RoutingController(StreamingVoiceController):
                 pcm = await self._commit_spec_audio(candidate, self._fingerprint(text, plan))
                 if pcm:
                     state.metrics.speculation = "hit+tts"
+                state.metrics.candidate_promoted_at = time.perf_counter()
                 await self._promote_speculative_candidate(state, candidate, pcm or [], plan)
                 return
 
@@ -327,7 +417,10 @@ class V2RoutingController(StreamingVoiceController):
             self._cancel_task(candidate.task)
             await self._abort_spec_audio(candidate)
             state.metrics.speculative_started_at = None
+            state.metrics.llm_request_started_at = None
+            state.metrics.llm_stream_opened_at = None
             state.metrics.llm_first_token_at = None
+            state.metrics.first_filtered_text_at = None
             state.metrics.first_safe_text_at = None
         state.candidate = None
         state.metrics.speculation = "miss" if candidate else "none"
@@ -341,28 +434,21 @@ class V2RoutingController(StreamingVoiceController):
         request.task = asyncio.create_task(self._generate(state, text, plan, request=request))
 
     def _response_plan(self, text: str) -> tuple[ResponsePlan, str | None]:
-        routed = self.router.route(text, self.session.agent)
+        if self.flags.enable_callback_state_machine and self.session.history:
+            last = self.session.history[-1]
+            if last.get("role") == "assistant":
+                self.callback_coordinator.observe_assistant(last.get("content", ""), self.session.slots)
+        routed = self.callback_coordinator.route(text, self.session.slots) if self.flags.enable_callback_state_machine else None
+        if routed is None:
+            routed = self.router.route(text, self.session.agent)
         if self._company_name and text in {
             "where are you calling from", "okay where are you calling from", "sorry from where",
             "which company", "what company", "who is this", "who are you", "who is calling",
         }:
-            routed = (ResponsePlan("identity"), f"I'm Riya, calling from {self._company_name} about your hiring plans.")
-        previous = self.session.history[-1]["content"] if self.session.history else ""
-        time_match = re.fullmatch(
-            r"(?:(?:yes|okay|ok|please|make it|at|tomorrow) )*"
-            r"(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|1[0-2]|[1-9])"
-            r"(?: [0-5][0-9])? ?(?:a ?m|p ?m)"
-            r"(?: afternoon| morning| evening| tomorrow| please)*", text,
-        )
-        callback_context = re.search(r"what time|convenient|preference|follow.up|callback", previous, re.I)
-        if time_match and callback_context:
             routed = (
-                ResponsePlan("callback-preference", slots_written={"callback_preference": text}),
-                f"I've recorded your preference for {text}. This is a requested time, not a confirmed booking.",
+                ResponsePlan("identity", intent_id="identity", allow_speculative_audio=True),
+                f"I'm Riya, calling from {self._company_name} about your hiring plans.",
             )
-        elif callback_context and text in {"tomorrow", "next week", "monday", "tuesday", "wednesday", "thursday", "friday"}:
-            routed = (ResponsePlan("callback-day", slots_written={"callback_day": text}),
-                      f"What time {text} would you prefer?")
         risk = str(self.session.agent.risk_policy.get("class", "LOW_PUBLIC"))
         if routed and routed[0].route == "cache" and risk != "LOW_PUBLIC":
             routed = None
@@ -380,11 +466,18 @@ class V2RoutingController(StreamingVoiceController):
                 )
                 speech = None
             else:
+                callback_sensitive = bool(
+                    re.search(r"\b(?:book|schedule|appointment|callback|follow.?up)\b", text, re.I)
+                    or self.session.slots.get("callback_state") not in {None, "", CallbackCoordinator.IDLE}
+                )
                 plan, speech = (
                     ResponsePlan(
                         "hosted",
+                        intent_id=None,
                         risk_class=risk,
                         allow_speculative_audio=risk in {"LOW_PUBLIC", "LOW_WORKFLOW"},
+                        requires_booking_guard=callback_sensitive,
+                        material_slots=tuple(sorted(self.session.slots)),
                     ),
                     None,
                 )
@@ -419,17 +512,17 @@ class V2RoutingController(StreamingVoiceController):
         )
         return [document for document in documents if not document.risk_class.startswith("HIGH_")]
 
-    def _fingerprint(self, text: str, plan: ResponsePlan) -> str:
+    def _fingerprint(self, text: str, plan: ResponsePlan, *, slots: dict | None = None) -> str:
         # The prefix check below ensures generic hosted turns cannot reuse a
         # plan merely because both map to the same broad route.
         return ResponseFingerprint.from_plan(
             tenant_id=self.session.tenant_id,
             agent_version=self.session.agent.version,
             state=str(self.session.state.get("name", "OPEN")),
-            intent=plan.route,
+            intent=plan.intent_id or plan.route,
             knowledge_version=self.session.agent.knowledge_version,
             plan=plan,
-            slots=self.session.slots,
+            slots=slots if slots is not None else self.session.slots,
         ).digest()
 
     def _candidate_matches(self, candidate: LLMRequest | None, final_text: str, final_plan: ResponsePlan) -> bool:
@@ -442,9 +535,13 @@ class V2RoutingController(StreamingVoiceController):
             return False
         basis_words = normalize(candidate.transcript).split()
         final_words = normalize(final_text).split()
-        return bool(basis_words and final_words == basis_words)
+        if not basis_words:
+            return False
+        if self.flags.enable_semantic_spec_reuse and final_plan.intent_id:
+            return True
+        return final_words == basis_words
 
-    def _messages(self, text: str, plan: ResponsePlan) -> list[dict[str, str]]:
+    def _messages(self, text: str, plan: ResponsePlan, *, slots: dict | None = None) -> list[dict[str, str]]:
         contract = (
             "Runtime output contract: Output spoken text only, without control markers. "
             "The runtime owns call termination. Do not claim a callback was scheduled or an action completed without a verified tool result. "
@@ -457,7 +554,7 @@ class V2RoutingController(StreamingVoiceController):
         messages = self.prompt_builder.build(
             agent=self.session.agent,
             state=self.session.state,
-            slots=self.session.slots,
+            slots=slots if slots is not None else self.session.slots,
             route=plan,
             knowledge=documents,
             history=self.session.history,
@@ -472,8 +569,12 @@ class V2RoutingController(StreamingVoiceController):
         stream = None
         started = False
         speech_filter = SpeechStreamFilter()
-        booking_guard = BookingClaimGuard()
-        chunker = SafeSpeechChunker(min_chars=self._safe_chunk_chars, min_words=self._safe_chunk_words)
+        booking_guard = BookingClaimGuard() if plan.requires_booking_guard else None
+        chunker = SafeSpeechChunker(
+            min_chars=self._safe_chunk_chars,
+            min_words=self._safe_chunk_words,
+            max_wait_ms=self._safe_chunk_max_wait_ms,
+        )
         parts: list[str] = []
 
         async def emit_safe(chunk: str) -> None:
@@ -481,20 +582,27 @@ class V2RoutingController(StreamingVoiceController):
             request.answer_chunks.append(chunk)
             if state.metrics.first_safe_text_at is None:
                 state.metrics.first_safe_text_at = time.perf_counter()
-            if request.speculative and self._spec_audio and request.spec_audio is None and plan.may_prepare_audio():
-                # This is a private Cartesia request. It can fail or remain
-                # cold without delaying the candidate LLM or public audio.
-                state.metrics.spec_tts_started_at = time.perf_counter()
-                request.spec_audio = await self._spec_audio.prepare(
-                    fingerprint=getattr(request, "v2_fingerprint", ""),
-                    transcript_basis=request.transcript,
-                    text=chunk,
+            if (
+                request.speculative
+                and self._spec_audio
+                and request.spec_audio is None
+                and request.spec_audio_task is None
+                and plan.may_prepare_audio()
+                # Stable interims may start private LLM/retrieval work. Flux
+                # speculative synthesis waits for the stronger EagerEOT level
+                # so provider cost is not spent on every changing prefix.
+                and (
+                    not self._flux_mode
+                    or self._flux_eager
+                    or getattr(request, "v2_source", "") == "eager"
                 )
-                if request.spec_audio is not None:
-                    # This exact safe phrase is the only one represented by
-                    # the private PCM prefix.  Any later safe chunks already
-                    # generated before hard EOT must still reach public TTS.
-                    request.spec_audio_text = chunk
+            ):
+                state.metrics.spec_tts_started_at = time.perf_counter()
+                request.spec_audio_text = chunk
+                request.spec_audio_task = asyncio.create_task(
+                    self._prepare_spec_audio(request, chunk),
+                    name=f"v2-spec-tts-{state.turn_id}",
+                )
             if request.speculative or not self._streaming:
                 return
             if not started:
@@ -511,14 +619,17 @@ class V2RoutingController(StreamingVoiceController):
         try:
             if state.metrics.speculative_started_at is None:
                 state.metrics.speculative_started_at = time.perf_counter()
+            state.metrics.llm_request_started_at = time.perf_counter()
             async with asyncio.timeout(20):
                 stream = await self._client.chat.completions.create(
                     model=self._model,
-                    messages=self._messages(text, plan),
+                    messages=self._messages(text, plan, slots=getattr(request, "v2_slots", None)),
                     stream=True,
                     temperature=0,
                     max_completion_tokens=self._llm_max_tokens,
                 )
+                state.metrics.llm_stream_opened_at = time.perf_counter()
+                logger.debug("V2 PROMPT TOKENS estimated={}", self.prompt_builder.section_token_estimates)
                 async for item in stream:
                     if self._state is not state or request.terminal:
                         return
@@ -528,12 +639,16 @@ class V2RoutingController(StreamingVoiceController):
                         continue
                     if state.metrics.llm_first_token_at is None:
                         state.metrics.llm_first_token_at = time.perf_counter()
-                    clean = booking_guard.push(speech_filter.push(content))
+                    filtered = speech_filter.push(content)
+                    clean = booking_guard.push(filtered) if booking_guard else filtered
                     if clean:
+                        if state.metrics.first_filtered_text_at is None:
+                            state.metrics.first_filtered_text_at = time.perf_counter()
                         parts.append(clean)
                         for safe in chunker.push(clean):
                             await emit_safe(safe)
-                tail = booking_guard.push(speech_filter.push("", final=True), final=True)
+                filtered_tail = speech_filter.push("", final=True)
+                tail = booking_guard.push(filtered_tail, final=True) if booking_guard else filtered_tail
                 if tail:
                     parts.append(tail)
                     for safe in chunker.push(tail):
@@ -566,14 +681,54 @@ class V2RoutingController(StreamingVoiceController):
             if stream is not None:
                 await stream.close()
 
+    async def _prepare_spec_audio(self, request: LLMRequest, chunk: str) -> None:
+        if not self._spec_audio or request.terminal or getattr(request, "spec_audio_invalidated", False):
+            return
+        prepared = await self._spec_audio.prepare(
+            fingerprint=getattr(request, "v2_fingerprint", ""),
+            transcript_basis=request.transcript,
+            text=chunk,
+        )
+        if request.terminal or getattr(request, "spec_audio_invalidated", False):
+            await self._spec_audio.abort(prepared)
+            return
+        request.spec_audio = prepared
+
+    async def _start_existing_spec_audio(self, state, request: LLMRequest) -> None:
+        """Upgrade an already-running stable candidate when EagerEOT arrives."""
+        if (
+            not self._spec_audio
+            or request.spec_audio is not None
+            or request.spec_audio_task is not None
+            or not request.answer_chunks
+            or not request.v2_plan.may_prepare_audio()
+        ):
+            return
+        chunk = request.answer_chunks[0]
+        state.metrics.spec_tts_started_at = time.perf_counter()
+        request.spec_audio_text = chunk
+        request.spec_audio_task = asyncio.create_task(
+            self._prepare_spec_audio(request, chunk),
+            name=f"v2-spec-tts-{state.turn_id}",
+        )
+
     async def _deliver(self, state, speech: str, plan: ResponsePlan) -> None:
         if self._state is not state or state.answer_finished:
             return
         await self._speak_fixed(state, speech)
         self._remember(state, speech)
         self._apply_plan(plan)
+        await self._configure_next_endpoint(speech)
         if plan.action == "end_call":
             await self.push_frame(EndFrame())
+
+    async def _configure_next_endpoint(self, speech: str) -> None:
+        updater = self._endpoint_profile_updater
+        if not updater or not self.flags.enable_dynamic_endpoints:
+            return
+        name = profile_for_prompt(speech)
+        await updater(name)
+        self._endpoint_profile = name
 
     async def _deliver_chunks(self, state, chunks: list[str], speech: str, plan: ResponsePlan) -> None:
         if not chunks or not self._streaming:
@@ -590,11 +745,33 @@ class V2RoutingController(StreamingVoiceController):
         await self._publish_answer_to_conversation(speech)
         self._remember(state, speech)
         self._apply_plan(plan)
+        await self._configure_next_endpoint(speech)
         if plan.action == "end_call":
             await self.push_frame(EndFrame())
 
     async def _commit_spec_audio(self, request: LLMRequest, fingerprint: str) -> list[bytes] | None:
+        if request.spec_audio is None and request.spec_audio_task and not request.spec_audio_task.done():
+            if self._spec_tts_commit_wait_secs > 0:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(request.spec_audio_task),
+                        timeout=self._spec_tts_commit_wait_secs,
+                    )
+                except TimeoutError:
+                    pass
+            if request.spec_audio is None:
+                request.spec_audio_invalidated = True
+                if self._state:
+                    self._state.metrics.spec_tts = "not-ready"
+                return None
+        if request.spec_audio is None and request.spec_audio_task and request.spec_audio_task.done():
+            try:
+                request.spec_audio_task.result()
+            except (asyncio.CancelledError, Exception):
+                pass
         if not self._spec_audio or request.spec_audio is None:
+            if self._state and request.spec_audio_task is not None:
+                self._state.metrics.spec_tts = "not-ready"
             return None
         pcm = await self._spec_audio.commit(request.spec_audio, fingerprint=fingerprint)
         if pcm and self._state:
@@ -605,11 +782,12 @@ class V2RoutingController(StreamingVoiceController):
     async def _abort_spec_audio(self, request: LLMRequest | None) -> None:
         if request is None:
             return
+        request.spec_audio_invalidated = True
         self._cancel_task(request.spec_audio_task)
         if self._spec_audio and request.spec_audio is not None:
             await self._spec_audio.abort(request.spec_audio)
             if self._state and self._state.metrics.spec_tts == "none":
-                self._state.metrics.spec_tts = "miss"
+                self._state.metrics.spec_tts = "cancelled"
 
     async def _promote_speculative_candidate(self, state, request: LLMRequest, pcm: list[bytes], plan: ResponsePlan) -> None:
         """Make a validated soft-EOT candidate public without restarting its LLM.
@@ -681,6 +859,7 @@ class V2RoutingController(StreamingVoiceController):
         await self._publish_answer_to_conversation(speech)
         self._remember(state, speech)
         self._apply_plan(plan)
+        await self._configure_next_endpoint(speech)
         if plan.action == "end_call":
             await self.push_frame(EndFrame())
 
@@ -702,6 +881,8 @@ class V2RoutingController(StreamingVoiceController):
             {"role": "assistant", "content": speech},
         ])
         self.session.history = self.session.history[-6:]
+        if self.flags.enable_callback_state_machine:
+            self.callback_coordinator.observe_assistant(speech, self.session.slots)
 
     async def cleanup(self):
         if self._settle_task:

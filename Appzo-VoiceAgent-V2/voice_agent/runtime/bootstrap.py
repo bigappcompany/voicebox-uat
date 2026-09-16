@@ -16,8 +16,11 @@ class RuntimeBootstrap:
     knowledge_index: TenantKnowledgeIndex = field(default_factory=TenantKnowledgeIndex)
 
     async def start_call(self, call_data: dict[str, Any], authoring_payload: dict[str, Any]) -> LatencyController:
-        bundle = self.compiler.compile_goodbox(authoring_payload)
-        await self.registry.put(bundle)
+        source_digest = self.compiler.source_digest(authoring_payload)
+        bundle = await self.registry.get_by_source(source_digest)
+        if bundle is None:
+            bundle = self.compiler.compile_goodbox(authoring_payload)
+            await self.registry.put(bundle, source_digest=source_digest)
         for document in bundle.knowledge_profile.get("documents", []):
             self.knowledge_index.add(
                 KnowledgeRecord(

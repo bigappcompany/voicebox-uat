@@ -148,15 +148,10 @@ class SpeculativeCartesiaBuffer:
         if candidate.invalidated or candidate.fingerprint != fingerprint:
             await self.abort(prepared)
             return None
-        # A response candidate may finish just before Cartesia sends its first
-        # audio frame.  A tiny bounded wait helps a hit without creating a new
-        # tail-latency source when the provider is slow.
-        if not candidate.pcm_chunks and not prepared.ready.is_set():
-            try:
-                await asyncio.wait_for(prepared.ready.wait(), timeout=0.025)
-            except TimeoutError:
-                pass
+        # Hard EOT never waits for speculative synthesis. Prepared PCM is an
+        # optimization only; the public WebSocket is the immediate fallback.
         if not candidate.pcm_chunks:
+            await self.abort(prepared)
             return None
         candidate.committed = True
         self._prepared.pop(prepared.context_id, None)

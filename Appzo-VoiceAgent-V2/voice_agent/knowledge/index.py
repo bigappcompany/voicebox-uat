@@ -12,7 +12,13 @@ class TenantKnowledgeIndex:
     def __init__(self) -> None: self._records: dict[tuple[str, str, str], list[KnowledgeRecord]] = {}
 
     def add(self, record: KnowledgeRecord) -> None:
-        self._records.setdefault((record.tenant_id, record.agent_id, record.knowledge_version), []).append(record)
+        key = (record.tenant_id, record.agent_id, record.knowledge_version)
+        records = self._records.setdefault(key, [])
+        # Bootstrap may reuse a compiled bundle for many calls. Keep the
+        # tenant index immutable by document identity instead of accumulating
+        # duplicate passages per call.
+        records[:] = [item for item in records if item.document_id != record.document_id]
+        records.append(record)
 
     def search(self, *, tenant_id: str, agent_id: str, knowledge_version: str, query: str, top_k: int = 3) -> list[KnowledgeRecord]:
         words = set(re.findall(r"\w+", query.lower()))

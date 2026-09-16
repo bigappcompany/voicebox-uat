@@ -6,10 +6,18 @@ from pipecat.frames.frames import TranscriptionFrame, UserStoppedSpeakingFrame, 
 from pipecat.turns.user_turn_controller import UserTurnController
 from pipecat.utils.asyncio.task_manager import TaskManager
 from voice_agent.turns.flux import OrderedFluxSTTService, FluxStopStrategy, flux_turn_strategies
+from voice_agent.turns.endpoint_profiles import flux_profile
 from voice_agent.speech.booking_guard import BookingClaimGuard
 
 
 class FluxOrderingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_endpoint_profile_can_update_without_reconnect(self):
+        stt = OrderedFluxSTTService(api_key="test")
+        await stt.configure_endpoint(flux_profile("yes_no"))
+        self.assertEqual(stt._settings.eager_eot_threshold, .30)
+        self.assertEqual(stt._settings.eot_threshold, .50)
+        self.assertEqual(stt._settings.eot_timeout_ms, 800)
+
     async def test_real_aggregator_delivers_complete_text_before_shutdown(self):
         from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregator, LLMUserAggregatorParams
         from pipecat.processors.aggregators.llm_context import LLMContext

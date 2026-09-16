@@ -21,5 +21,6 @@ class FlowEngine:
 
     def plan(self, flow: dict, current_state: str, intent: str, slots: dict[str, str], *, risk_class: str = "LOW_PUBLIC") -> ResponsePlan:
         result = self.transition(flow, current_state, intent, slots)
-        return ResponsePlan(route="flow", action=result.action, next_state=result.next_state, risk_class=risk_class,
-                            slots_written=result.slots_written, allow_speculative_audio=risk_class.startswith("LOW_"))
+        return ResponsePlan(route="flow", intent_id=intent, action=result.action, next_state=result.next_state,
+                            risk_class=risk_class, slots_written=result.slots_written,
+                            allow_speculative_audio=risk_class.startswith("LOW_"))

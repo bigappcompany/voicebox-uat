@@ -19,7 +19,9 @@ class SafeSpeechChunker:
         enough = len(self.buffer) >= self.min_chars or len(self.buffer.split()) >= self.min_words
         boundary = self._last_boundary()
         if boundary and enough: return [self._pop(boundary)]
-        if (now - self.first_token_at) * 1000 >= self.max_wait_ms:
+        # The timer is a latency backstop, not permission to synthesize a
+        # single token in its own TTS context. Preserve phrase-sized output.
+        if enough and (now - self.first_token_at) * 1000 >= self.max_wait_ms:
             word_boundary = self._last_word_boundary()
             if word_boundary and not self._unsafe_tail(word_boundary): return [self._pop(word_boundary)]
         return []

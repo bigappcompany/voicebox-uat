@@ -20,6 +20,9 @@ class AgentBundle:
     tts_profile: dict[str, Any] = field(default_factory=dict)
     knowledge_profile: dict[str, Any] = field(default_factory=dict)
     cached_utterances: dict[str, str] = field(default_factory=dict)
+    compiled_prompt: dict[str, Any] = field(default_factory=dict)
+    fact_profile: dict[str, Any] = field(default_factory=dict)
+    cache_policy: dict[str, Any] = field(default_factory=dict)
 
     @property
     def knowledge_version(self) -> str:

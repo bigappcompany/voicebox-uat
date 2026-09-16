@@ -15,7 +15,10 @@ class ResponseFingerprint:
 
     @classmethod
     def from_plan(cls, *, tenant_id: str, agent_version: str, state: str, intent: str, knowledge_version: str, plan: ResponsePlan, slots: dict[str, object]) -> "ResponseFingerprint":
-        material = set(plan.slots_read) | set(plan.slots_written)
+        # Prompt-visible facts can change the answer even when a flow omitted
+        # an explicit slots_read declaration. Default to all current slots;
+        # a compiled plan may narrow this with material_slots.
+        material = set(plan.material_slots or plan.slots_read or slots.keys()) | set(plan.slots_written)
         return cls(
             tenant_id,
             agent_version,

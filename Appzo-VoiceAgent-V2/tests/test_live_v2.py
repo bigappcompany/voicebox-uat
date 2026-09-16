@@ -174,6 +174,31 @@ class LiveRoutingTests(unittest.IsolatedAsyncioTestCase):
         await self.controller._invalidate_candidate()
         self.assertIsNone(self.controller._state.candidate)
 
+    async def test_flux_stable_interim_starts_private_work_before_eager_eot(self):
+        self.controller._flux_mode = True
+        self.controller._stable_interim_secs = 0.01
+        self.client.chat.completions.create.return_value = FakeStream(["Which roles do you need?"])
+        await self.controller._on_interim("we need four")
+        await self.controller._on_interim("we need four engineers")
+        await asyncio.sleep(0.02)
+        candidate = self.controller._state.candidate
+        self.assertIsNotNone(candidate)
+        await candidate.task
+        self.assertFalse(self.controller._flux_eager)
+        self.controller.push_frame.assert_not_awaited()
+
+    async def test_flux_resume_cancels_stable_interim_debounce(self):
+        self.controller._flux_mode = True
+        self.controller._stable_interim_secs = 1
+        await self.controller._on_interim("we need four")
+        await self.controller._on_interim("we need four engineers")
+        debounce = self.controller._state.debounce_task
+        self.assertIsNotNone(debounce)
+        await self.controller._invalidate_candidate()
+        await asyncio.gather(debounce, return_exceptions=True)
+        self.assertTrue(debounce.cancelled())
+        self.assertIsNone(self.controller._state.candidate)
+
     async def test_punctuated_callback_time_is_local(self):
         from main import normalize
         self.controller.session.history = [{"role": "assistant", "content": "What time tomorrow is convenient?"}]

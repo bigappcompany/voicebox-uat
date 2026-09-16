@@ -8,6 +8,7 @@ webhook that Goodbox's Plivo number reaches after a call is placed.
 import base64
 import hashlib
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlencode, urlparse, urlunparse
@@ -288,6 +289,7 @@ async def plivo_callback(
 async def plivo_media(websocket: WebSocket, body: str = Query("")) -> None:
     #logger.log("Received plivo ws connection")
     await websocket.accept()
+    telephony_connected_at = time.perf_counter()
     try:
         import json
 
@@ -339,6 +341,8 @@ async def plivo_media(websocket: WebSocket, body: str = Query("")) -> None:
                     runtime_config=_runtime_from_goodbox(config),
                     transcript_callback=transcript.add,
                     v2_session=v2_controller.session,
+                    telephony_stream_id=call_data["stream_id"],
+                    telephony_connected_at=telephony_connected_at,
                 )
             finally:
                 # Goodbox receives all completed user/assistant turns even when

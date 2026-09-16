@@ -54,11 +54,14 @@ class V2RuntimeTests(unittest.TestCase):
         runtime, saved = asyncio.run(run())
         self.assertEqual((runtime.session.call_id, saved.tenant_id), ("c", "t"))
 
-    def test_risky_optimizations_default_off(self):
+    def test_requested_v2_improvements_default_on_with_provider_swaps_off(self):
         flags = RuntimeFlags()
         self.assertTrue(flags.enable_agent_bundle)
-        self.assertFalse(flags.enable_spec_tts)
+        self.assertTrue(flags.enable_spec_tts)
+        self.assertTrue(flags.enable_structured_facts)
+        self.assertTrue(flags.enable_semantic_spec_reuse)
         self.assertFalse(flags.enable_flux)
+        self.assertFalse(flags.enable_local_llm)
 
     def test_goodbox_flux_alias_uses_the_v2_multilingual_flux_model(self):
         from goodbox_server import _runtime_from_goodbox
