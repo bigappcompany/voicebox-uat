@@ -38,6 +38,7 @@ from voice_agent.speech.greeting_cache import (
 )
 from voice_agent.speech.audio_quality import InitialSilenceTrimmer
 from voice_agent.speech.safe_chunker import SafeSpeechChunker
+from voice_agent.speech.booking_guard import BookingClaimGuard
 from voice_agent.turns.endpoint_profiles import flux_profile, profile_for_prompt
 
 
@@ -62,12 +63,42 @@ class ImprovementUnitTests(unittest.TestCase):
         self.assertEqual(profile_for_prompt("Is your company hiring right now?"), "yes_no")
         self.assertEqual(profile_for_prompt("What time should we call?"), "short_entity")
         self.assertEqual(profile_for_prompt("Which roles and how many people?"), "requirements")
+        self.assertEqual(profile_for_prompt("Is this a good time to speak?"), "yes_no")
+        self.assertEqual(
+            profile_for_prompt("Could you share the roles and expected timeline?"),
+            "requirements",
+        )
 
     def test_safe_chunker_timer_never_emits_a_single_word(self):
         chunker = SafeSpeechChunker(min_chars=20, min_words=3, max_wait_ms=80)
         self.assertEqual(chunker.push("Hello ", now=1.0), [])
         self.assertEqual(chunker.push("there", now=2.0), [])
         self.assertEqual(chunker.flush(), ["Hello there"])
+
+    def test_safe_chunker_releases_a_complete_punctuated_phrase_without_waiting_for_next_delta(self):
+        chunker = SafeSpeechChunker(min_chars=20, min_words=3, max_wait_ms=240)
+        self.assertEqual(
+            chunker.push("We can discuss your hiring plans.", now=1.0),
+            ["We can discuss your hiring plans."],
+        )
+
+    def test_booking_guard_blocks_unverified_connect_and_meeting_claims(self):
+        guard = BookingClaimGuard()
+        self.assertEqual(
+            guard.push("I will connect with you tomorrow at five pm."),
+            "Your requested follow-up time needs confirmation from the team. ",
+        )
+        self.assertEqual(
+            guard.push("I have noted the meeting for tomorrow."),
+            "Your requested follow-up time needs confirmation from the team. ",
+        )
+        self.assertEqual(guard.push("Noted, you are hiring five people."), "Noted, you are hiring five people.")
+
+    def test_compiler_creates_runtime_invariant_once_when_authoring_is_large(self):
+        source = "You are Riya calling from Example Staffing. " + "General material. " * 600 + "Never claim a callback is confirmed."
+        compiled = AgentCompiler().compile_goodbox({"chatbot_id": "a", "tenant_id": "t", "prompt": source})
+        self.assertLessEqual(len(compiled.compiled_prompt["invariant"]), 3600)
+        self.assertIn("Never claim a callback is confirmed.", compiled.compiled_prompt["invariant"])
 
     def test_initial_silence_trimmer_preserves_preroll(self):
         trimmer = InitialSilenceTrimmer()

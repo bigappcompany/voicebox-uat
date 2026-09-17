@@ -220,6 +220,20 @@ class LiveRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.client.chat.completions.create.assert_not_awaited()
         self.assertIn("not a confirmed booking", self.controller.push_frame.await_args.args[0].text)
 
+    async def test_callback_preference_acknowledgement_stays_local_and_unconfirmed(self):
+        self.controller.session.slots.update(
+            {
+                "callback_state": "PREFERENCE_RECORDED",
+                "callback_preference": "tomorrow at five pm",
+            }
+        )
+        state = await self.answer("yes")
+        self.assertEqual(state.metrics.route, "v2-callback-preference-acknowledged")
+        self.client.chat.completions.create.assert_not_awaited()
+        speech = self.controller.push_frame.await_args.args[0].text.casefold()
+        self.assertIn("requested follow-up time", speech)
+        self.assertIn("confirm availability", speech)
+
     async def test_unrelated_time_is_not_a_callback(self):
         self.client.chat.completions.create.return_value = FakeStream(["What would you like to do then?"])
         state = await self.answer("two pm tomorrow")

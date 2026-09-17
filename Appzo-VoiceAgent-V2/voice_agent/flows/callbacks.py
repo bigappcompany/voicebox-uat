@@ -52,6 +52,18 @@ class CallbackCoordinator:
                 followup_consent="yes",
             )
 
+        # A preference has already been captured locally. A subsequent
+        # affirmative response must not fall through to the hosted model,
+        # where it previously produced claims such as "I will connect with
+        # you tomorrow" despite there being no scheduling integration.
+        if state == self.PREFERENCE_RECORDED and yes:
+            preference = str(slots.get("callback_preference") or "your requested time")
+            return self._fixed(
+                "callback-preference-acknowledged",
+                f"Thanks. I've recorded {preference} as a requested follow-up time. Our team will confirm availability.",
+                callback_state=self.PREFERENCE_RECORDED,
+            )
+
         if state not in {self.AWAITING_DAY_TIME, self.AWAITING_DAY, self.AWAITING_TIME, self.FOLLOWUP_OFFERED}:
             return None
         day_match = re.search(rf"\b({self._days})\b", normalized)

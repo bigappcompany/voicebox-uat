@@ -1,7 +1,11 @@
 """Compilation boundary between authoring payloads and small runtime artifacts."""
 import hashlib
 import json
+import os
+import re
 from typing import Any
+
+from loguru import logger
 
 from .bundle import AgentBundle
 
@@ -31,6 +35,20 @@ class AgentCompiler:
         runtime_prompt = payload.get("runtime_prompt") or agent.get("runtime_prompt") or {}
         if isinstance(runtime_prompt, str):
             runtime_prompt = {"invariant": runtime_prompt}
+        if not isinstance(runtime_prompt, dict):
+            runtime_prompt = {}
+        # Goodbox authoring prompts can be ~20k characters. Sending a blind
+        # head/tail slice on every caller turn is both slow and semantically
+        # unstable: a policy in the omitted middle silently disappears. A
+        # tenant can provide `runtime_prompt.invariant` for exact control. For
+        # existing agents, compile a deterministic compact invariant once at
+        # call setup; it preserves high-signal authoring rules without putting
+        # truncation logic on the hot path.
+        if not str(runtime_prompt.get("invariant") or "").strip():
+            runtime_prompt = {
+                **runtime_prompt,
+                "invariant": self._compile_runtime_invariant(system),
+            }
         fact_profile = payload.get("fact_profile") or agent.get("fact_profile") or {}
         if not isinstance(fact_profile, dict):
             fact_profile = {}
@@ -71,6 +89,53 @@ class AgentCompiler:
             fact_profile=fact_profile,
             cache_policy=dict(payload.get("cache_policy") or agent.get("cache_policy") or {}),
         )
+
+    @staticmethod
+    def _compile_runtime_invariant(source: str) -> str:
+        """Derive a bounded fallback invariant once, outside the media path.
+
+        This is deliberately an extraction, not a summarization call: no
+        external model, latency, or authoring data leaves the process. It
+        keeps source-order so later tenant rules retain their usual override
+        semantics. Supplying `runtime_prompt.invariant` remains the exact,
+        recommended authoring interface.
+        """
+        limit = max(800, int(os.getenv("V2_COMPILED_RUNTIME_PROMPT_CHARS", "3600")))
+        source = " ".join(str(source).split())
+        if len(source) <= limit:
+            return source
+
+        # Split after sentence punctuation and retain sentences carrying
+        # identity, safety, language, output, campaign, or business-fact
+        # instructions. The first sentence is included as it commonly names
+        # the caller, company, or campaign.
+        sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", source) if part.strip()]
+        high_signal = re.compile(
+            r"\b(?:you are|name is|company|calling from|identity|language|english|hindi|hinglish|"
+            r"must|must not|never|do not|don't|only|always|avoid|policy|safe|consent|"
+            r"schedule|book|callback|appointment|confirm|output|response|sentence|concise|"
+            r"hiring|staffing|recruit|role|candidate|service|offer|pricing|payment)\b",
+            re.I,
+        )
+        selected: list[str] = []
+        used = 0
+        for index, sentence in enumerate(sentences):
+            if index and not high_signal.search(sentence):
+                continue
+            addition = len(sentence) + (1 if selected else 0)
+            if used + addition > limit:
+                continue
+            selected.append(sentence)
+            used += addition
+        if not selected:
+            selected = [source[:limit].rsplit(" ", 1)[0]]
+        result = " ".join(selected)
+        logger.warning(
+            "V2 compiled runtime prompt original_chars={} runtime_chars={}; supply runtime_prompt.invariant for exact authoring",
+            len(source),
+            len(result),
+        )
+        return result
 
     @staticmethod
     def _knowledge_profile(raw: Any, version: str) -> dict[str, Any]:

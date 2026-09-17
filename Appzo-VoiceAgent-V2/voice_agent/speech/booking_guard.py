@@ -22,6 +22,22 @@ class BookingClaimGuard:
 
     @staticmethod
     def check(sentence):
-        if re.search(r"\b(scheduled|booked|confirmed|reserved|will (?:call|reach out|contact))\b", sentence, re.I):
-            return "Your requested callback time still needs confirmation from the team. "
+        # This guard is intentionally narrow enough not to rewrite ordinary
+        # acknowledgements (for example, "noted, you need five people"), but
+        # broad enough to catch the unsupported commitments observed in live
+        # calls: "I have noted the meeting", "I can arrange a connect", and
+        # "I will connect with you tomorrow". No scheduling tool exists in
+        # this runtime, so none of these claims may reach TTS.
+        claim = re.search(
+            r"\b(?:scheduled|booked|confirmed|reserved)\b|"
+            r"\b(?:i\s+)?(?:will|can|shall|am going to|['’]ll)\s+"
+            r"(?:call|reach out|contact|connect|arrange|schedule|book)\b|"
+            r"\b(?:i\s+)?(?:have|['’]ve)\s+(?:arranged|scheduled|booked|confirmed)\b|"
+            r"\b(?:noted|recorded)\s+(?:the\s+)?(?:meeting|appointment|call|callback)\b|"
+            r"\barrange(?:d|ment)?\s+(?:a\s+)?(?:meeting|appointment|call|callback|connect)\b",
+            sentence,
+            re.I,
+        )
+        if claim:
+            return "Your requested follow-up time needs confirmation from the team. "
         return sentence

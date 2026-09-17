@@ -101,9 +101,14 @@ class V2RoutingController(StreamingVoiceController):
         ) / 1000
         self._stable_interim_secs = float(os.getenv("V2_STABLE_INTERIM_MS", "80")) / 1000
         self._spec_max_restarts = int(os.getenv("V2_SPECULATION_MAX_RESTARTS", "2"))
-        self._safe_chunk_chars = int(os.getenv("V2_SAFE_CHUNK_CHARS", "20"))
-        self._safe_chunk_words = int(os.getenv("V2_SAFE_CHUNK_WORDS", "3"))
-        self._safe_chunk_max_wait_ms = int(os.getenv("V2_SAFE_CHUNK_MAX_WAIT_MS", "80"))
+        # These defaults intentionally wait for a compact clause.  The former
+        # 20-character / three-word / 80-ms threshold handed Cartesia tiny
+        # continuations, exposing any later model-token delay as audible
+        # word-by-word speech.
+        self._safe_chunk_chars = int(os.getenv("V2_SAFE_CHUNK_CHARS", "48"))
+        self._safe_chunk_words = int(os.getenv("V2_SAFE_CHUNK_WORDS", "7"))
+        self._safe_chunk_max_wait_ms = int(os.getenv("V2_SAFE_CHUNK_MAX_WAIT_MS", "240"))
+        self._min_final_transcript_chars = int(os.getenv("V2_MIN_FINAL_TRANSCRIPT_CHARS", "2"))
         self._spec_restart_min_new_words = int(os.getenv("V2_SPEC_RESTART_MIN_NEW_WORDS", "3"))
         self._spec_tts_commit_wait_secs = float(os.getenv("V2_SPEC_TTS_COMMIT_WAIT_MS", "40")) / 1000
         self._endpoint_profile_updater = None
@@ -330,6 +335,16 @@ class V2RoutingController(StreamingVoiceController):
         await asyncio.sleep(0 if self._stt_finalized else self._settle_seconds)
         text, self._pending_text = self._pending_text, ""
         self._latest_finalized_text = ""
+        normalized = normalize(text)
+        if normalized and len(normalized) < self._min_final_transcript_chars:
+            # Flux occasionally finalizes a one-character noise fragment. It
+            # must not trigger another full greeting/pitch after the cached
+            # greeting has already played.
+            if self._state and not self._state.committed:
+                self._state.committed = True
+                self._state.metrics.route = "stt-noise-ignored"
+            logger.info("V2 ignored short final transcript chars={}", len(normalized))
+            return
         await super().handle_native_turn_stopped(text)
 
     def _is_meaningful_barge_in(self, text: str) -> bool:
@@ -545,8 +560,8 @@ class V2RoutingController(StreamingVoiceController):
         contract = (
             "Runtime output contract: Output spoken text only, without control markers. "
             "The runtime owns call termination. Do not claim a callback was scheduled or an action completed without a verified tool result. "
-            "No scheduling tool is connected. Answer the immediate question first in one short sentence, then at most one relevant question. "
-            "Do not repeat the pitch, invent a company name, or treat uncertainty as consent."
+            "No scheduling tool is connected. Answer the immediate question first in one short sentence (max 12 words), then ask at most one short question (max 10 words). "
+            "Total response must be under 100 characters. Do not repeat the pitch, invent a company name, or treat uncertainty as consent."
         )
         documents = self._knowledge_for(text, plan)
         if plan.knowledge_ids:
@@ -576,12 +591,31 @@ class V2RoutingController(StreamingVoiceController):
             max_wait_ms=self._safe_chunk_max_wait_ms,
         )
         parts: list[str] = []
+        speech_chunk_count = 0
+        last_safe_chunk_at: float | None = None
 
         async def emit_safe(chunk: str) -> None:
-            nonlocal started
+            nonlocal started, speech_chunk_count, last_safe_chunk_at
+            now = time.perf_counter()
             request.answer_chunks.append(chunk)
             if state.metrics.first_safe_text_at is None:
-                state.metrics.first_safe_text_at = time.perf_counter()
+                state.metrics.first_safe_text_at = now
+            speech_chunk_count += 1
+            gap_ms = (
+                round((now - last_safe_chunk_at) * 1000, 1)
+                if last_safe_chunk_at is not None
+                else 0.0
+            )
+            last_safe_chunk_at = now
+            logger.debug(
+                "V2 SPEECH CHUNK | turn={} n={} chars={} words={} upstream_gap_ms={} speculative={}",
+                state.turn_id,
+                speech_chunk_count,
+                len(chunk),
+                len(chunk.split()),
+                gap_ms,
+                request.speculative,
+            )
             if (
                 request.speculative
                 and self._spec_audio

@@ -32,10 +32,16 @@ FLUX_PROFILES = {
     # The default sales-call profile favours responsiveness while retaining a
     # timeout long enough for short natural pauses.
     "fast": FluxEndpointProfile(.35, .55, 1200),
-    "yes_no": FluxEndpointProfile(.30, .50, 800),
-    "short_entity": FluxEndpointProfile(.30, .52, 1000),
-    "requirements": FluxEndpointProfile(.35, .55, 1400),
-    "freeform": FluxEndpointProfile(.40, .62, 2200),
+    # yes_no: caller gave a simple yes/no; fire quickly, accept a few mis-fires.
+    "yes_no": FluxEndpointProfile(.30, .50, 500),
+    # short_entity: name / date / company — short pause after the answer.
+    "short_entity": FluxEndpointProfile(.30, .52, 700),
+    # requirements: caller listing roles / headcount — needs a longer window to
+    # complete a sentence, but shorter than freeform to avoid 1-2 s pauses.
+    "requirements": FluxEndpointProfile(.30, .50, 900),
+    # freeform: open-ended answer — match old requirements timeout so we don't
+    # cut off mid-sentence while being twice as fast as the old 2200 ms.
+    "freeform": FluxEndpointProfile(.35, .55, 1400),
 }
 
 
@@ -46,14 +52,20 @@ def flux_profile(name: str) -> FluxEndpointProfile:
 def profile_for_prompt(text: str) -> str:
     """Choose the next turn's profile from the question just spoken."""
     value = " ".join(text.casefold().split())
+    # Ask for detailed hiring requirements before looking for a yes/no shape:
+    # "Could you share the roles ...?" is grammatically a question but is not
+    # a binary answer and must not use the aggressively short timeout.
+    if re.search(r"\b(?:roles?|headcount|how many|timeline|departments?|requirements?|skills?)\b", value):
+        return "requirements"
+    # Collecting one compact entity benefits from the entity profile even if
+    # the sentence also contains a polite auxiliary such as "could you".
+    if re.search(r"\b(?:what|which)\s+(?:day|time|date|name)\b|\bwhen\b", value):
+        return "short_entity"
     if re.search(
         r"\b(?:would|are|do|did|can|will|is|have)\s+you\b|"
-        r"\b(?:is|does|will)\s+your\b|\bare\s+there\b",
+        r"\b(?:is|does|will)\s+your\b|\bare\s+there\b|"
+        r"\bis\s+this\s+(?:a\s+)?(?:good|okay|ok)\s+time\b",
         value,
     ):
         return "yes_no"
-    if re.search(r"\b(?:what|which)\s+(?:day|time|date|name)\b|\bwhen\b", value):
-        return "short_entity"
-    if re.search(r"\b(?:roles?|headcount|how many|timeline|departments?)\b", value):
-        return "requirements"
     return "freeform"

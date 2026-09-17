@@ -146,6 +146,7 @@ class TurnMetrics:
     output_last_packet_at: float | None = None
     output_packet_count: int = 0
     output_max_packet_gap_ms: float = 0.0
+    output_long_gap_count: int = 0
     output_silent_packet_count: int = 0
     output_audio_ms: float = 0.0
     bot_started_at: float | None = None
@@ -605,6 +606,7 @@ class LiveLatencyObserver(BaseObserver):
         self._samples: list[int] = []
         self._audible_samples: list[int] = []
         self._audible_threshold = int(os.getenv("V2_AUDIBLE_PCM_RMS", "200"))
+        self._audio_gap_alert_ms = max(100, int(os.getenv("V2_AUDIO_GAP_ALERT_MS", "350")))
         self._breakdown_min_secs = max(
             0.0, float(os.getenv("V2_LATENCY_BREAKDOWN_MIN_MS", "1")) / 1000
         )
@@ -638,10 +640,17 @@ class LiveLatencyObserver(BaseObserver):
         if metrics.output_first_packet_at is None:
             metrics.output_first_packet_at = now
         if metrics.output_last_packet_at is not None:
-            metrics.output_max_packet_gap_ms = max(
-                metrics.output_max_packet_gap_ms,
-                (now - metrics.output_last_packet_at) * 1000,
-            )
+            gap_ms = (now - metrics.output_last_packet_at) * 1000
+            metrics.output_max_packet_gap_ms = max(metrics.output_max_packet_gap_ms, gap_ms)
+            if gap_ms >= self._audio_gap_alert_ms:
+                metrics.output_long_gap_count += 1
+                logger.warning(
+                    "V2 AUDIO GAP | turn={} gap_ms={} threshold_ms={} packets_before_gap={}",
+                    metrics.turn_id,
+                    round(gap_ms, 1),
+                    self._audio_gap_alert_ms,
+                    metrics.output_packet_count,
+                )
         metrics.output_last_packet_at = now
         metrics.output_packet_count += 1
         metrics.output_audio_ms += len(data.frame.audio) / max(1, data.frame.sample_rate * 2) * 1000
@@ -683,11 +692,12 @@ class LiveLatencyObserver(BaseObserver):
         ):
             self._cadence_seen.add(metrics.turn_id)
             logger.info(
-                "AUDIO CADENCE | turn={} packets={} audio_ms={} max_packet_gap_ms={} silent_packets={}",
+                "AUDIO CADENCE | turn={} packets={} audio_ms={} max_packet_gap_ms={} long_gaps={} silent_packets={}",
                 metrics.turn_id,
                 metrics.output_packet_count,
                 round(metrics.output_audio_ms),
                 round(metrics.output_max_packet_gap_ms, 1),
+                metrics.output_long_gap_count,
                 metrics.output_silent_packet_count,
             )
             logger.info(
@@ -698,6 +708,7 @@ class LiveLatencyObserver(BaseObserver):
                         "turn_id": metrics.turn_id,
                         "output_packet_count": metrics.output_packet_count,
                         "output_max_packet_gap_ms": metrics.output_max_packet_gap_ms,
+                        "output_long_gap_count": metrics.output_long_gap_count,
                         "output_silent_packet_count": metrics.output_silent_packet_count,
                         "output_audio_ms": metrics.output_audio_ms,
                     },
@@ -805,6 +816,7 @@ class LiveLatencyObserver(BaseObserver):
             "output_first_non_silent_at": metrics.output_first_non_silent_at,
             "output_packet_count": metrics.output_packet_count,
             "output_max_packet_gap_ms": metrics.output_max_packet_gap_ms,
+            "output_long_gap_count": metrics.output_long_gap_count,
             "output_silent_packet_count": metrics.output_silent_packet_count,
             "output_audio_ms": metrics.output_audio_ms,
             "first_audible_at": first_audible,
@@ -1049,6 +1061,7 @@ async def run_bot(
         language_hints = [Language.EN, Language.HI] if runtime.stt_language == "multi" else None
         stt = OrderedFluxSTTService(
             api_key=runtime.deepgram_api_key,
+            url=os.getenv("DEEPGRAM_FLUX_URL", "wss://api.in.deepgram.com/v2/listen"),
             settings=DeepgramFluxSTTService.Settings(
                 model=runtime.stt_model,
                 language_hints=language_hints,
@@ -1120,15 +1133,18 @@ async def run_bot(
             from resilient_tts import ResilientCartesiaTTSService
             tts_class = ResilientCartesiaTTSService
         tts = tts_class(
-        api_key=runtime.cartesia_api_key,
-        settings=tts_settings,
-        sample_rate=24000,
-        encoding="pcm_s16le",
-        container="raw",
-        # V2's SafeSpeechChunker emits complete phrase-sized chunks; token
-        # mode prevents Pipecat from adding a second sentence-sized wait.
-        text_aggregation_mode=(TextAggregationMode.TOKEN if controller_options else TextAggregationMode.SENTENCE),
-        max_buffer_delay_ms=0 if controller_options else None,
+            api_key=runtime.cartesia_api_key,
+            settings=tts_settings,
+            sample_rate=24000,
+            encoding="pcm_s16le",
+            container="raw",
+            # V2's SafeSpeechChunker emits complete phrase-sized chunks; token
+            # mode prevents Pipecat from adding a second sentence-sized wait.
+            # A non-zero buffer delay lets Cartesia bridge the gap between
+            # successive phrase chunks when the LLM streams tokens slowly, avoiding
+            # the elongated-word / dropout artefact on slow-LLM turns.
+            text_aggregation_mode=(TextAggregationMode.TOKEN if controller_options else TextAggregationMode.SENTENCE),
+            max_buffer_delay_ms=int(os.getenv("V2_TTS_BUFFER_DELAY_MS", "150")) if controller_options else None,
         )
     pipeline_processors = [transport.input(), stt, controller, user_aggregator, tts]
     if controller_options and os.getenv("ENABLE_TTS_LEADING_SILENCE_TRIM", "true").lower() == "true":
