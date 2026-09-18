@@ -16,7 +16,7 @@ class FluxOrderingTests(unittest.IsolatedAsyncioTestCase):
         await stt.configure_endpoint(flux_profile("yes_no"))
         self.assertEqual(stt._settings.eager_eot_threshold, .30)
         self.assertEqual(stt._settings.eot_threshold, .50)
-        self.assertEqual(stt._settings.eot_timeout_ms, 800)
+        self.assertEqual(stt._settings.eot_timeout_ms, 500)
 
     async def test_real_aggregator_delivers_complete_text_before_shutdown(self):
         from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregator, LLMUserAggregatorParams

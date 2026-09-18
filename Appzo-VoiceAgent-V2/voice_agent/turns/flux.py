@@ -57,13 +57,15 @@ class OrderedFluxSTTService(DeepgramFluxSTTService):
         await self.push_frame(FluxResumeFrame())
         await super()._handle_turn_resumed(event)
 
-    async def configure_endpoint(self, profile) -> None:
-        """Apply a Flux endpoint profile over the existing WebSocket."""
+    async def configure_endpoint(self, profile, *, keyterms=None, language_hints=None) -> None:
+        """Apply a state-aware Flux profile over the existing WebSocket."""
         await self._update_settings(
             self.Settings(
                 eager_eot_threshold=profile.eager_eot_threshold,
                 eot_threshold=profile.eot_threshold,
                 eot_timeout_ms=profile.eot_timeout_ms,
+                keyterm=keyterms,
+                language_hints=language_hints,
             )
         )
 

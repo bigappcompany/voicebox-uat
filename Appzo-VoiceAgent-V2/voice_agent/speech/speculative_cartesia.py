@@ -244,9 +244,20 @@ class SpeculativeCartesiaBuffer:
                             prepared.first_audio_at = time.perf_counter()
                             prepared.ready.set()
                     else:
-                        # Cap cost/memory.  The normal TTS stream will continue
-                        # from the remaining response after a commit.
-                        await self.abort(prepared)
+                        # The cap is a successful partial preparation, not an
+                        # invalidation. Stop provider generation while keeping
+                        # already-buffered PCM eligible for hard-EOT commit.
+                        self._prepared.pop(prepared.context_id, None)
+                        prepared.completed = True
+                        prepared.ready.set()
+                        try:
+                            async with self._send_lock:
+                                if self.is_connected:
+                                    await self._websocket.send(json.dumps({
+                                        "context_id": prepared.context_id, "cancel": True,
+                                    }))
+                        except Exception:
+                            pass
                 elif kind in {"done", "flush_done"}:
                     prepared.completed = True
                     prepared.ready.set()

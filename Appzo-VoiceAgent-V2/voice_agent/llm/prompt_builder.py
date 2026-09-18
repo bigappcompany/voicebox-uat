@@ -1,6 +1,8 @@
 import json
 import os
 
+from typing import Any
+
 from loguru import logger
 
 from ..agents.bundle import AgentBundle
@@ -17,6 +19,32 @@ class PromptBuilder:
         self.compiled = compiled
         self.section_token_estimates: dict[str, int] = {}
 
+    @classmethod
+    def _normalize_for_json(cls, val: Any) -> Any:
+        if hasattr(val, "to_primitive") and callable(getattr(val, "to_primitive")):
+            val = val.to_primitive()
+        if isinstance(val, dict):
+            return {str(k): cls._normalize_for_json(v) for k, v in sorted(val.items(), key=lambda item: str(item[0]))}
+        if isinstance(val, (list, tuple)):
+            return [cls._normalize_for_json(item) for item in val]
+        if isinstance(val, (set, frozenset)):
+            return [cls._normalize_for_json(item) for item in sorted(list(val), key=str)]
+        if isinstance(val, (int, float, bool, str)) or val is None:
+            return val
+        return str(val)
+
+    def _safe_json_dumps(self, obj: Any) -> str:
+        normalized = self._normalize_for_json(obj)
+        return json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    @classmethod
+    def _json_default(cls, obj: object) -> object:
+        if hasattr(obj, "to_primitive") and callable(getattr(obj, "to_primitive")):
+            return obj.to_primitive()
+        if isinstance(obj, (set, frozenset)):
+            return sorted(list(obj))
+        return str(obj)
+
     def build(self, *, agent: AgentBundle, state: dict, slots: dict, route: ResponsePlan, knowledge: list, history: list, user_text: str) -> list[dict[str, str]]:
         state_name = str(state.get("name", "OPEN"))
         state_config = (agent.flow_graph.get("states") or {}).get(state_name, {})
@@ -27,12 +55,18 @@ class PromptBuilder:
             or agent.invariant_prompt
         ).strip()
         invariant = self._bounded_invariant(invariant)
-        state_actions = state_config.get("allowed_actions") or state_config.get("actions") or agent.actions.keys()
-        if isinstance(state_actions, dict):
-            state_actions = state_actions.keys()
+        actions_source = state_config.get("allowed_actions") or state_config.get("actions") or getattr(agent, "actions", {})
+        if isinstance(actions_source, dict):
+            state_actions = list(actions_source.keys())
+        elif isinstance(actions_source, (list, tuple, set)):
+            state_actions = list(actions_source)
+        elif hasattr(actions_source, "keys") and callable(getattr(actions_source, "keys")):
+            state_actions = list(actions_source.keys())
+        else:
+            state_actions = [actions_source] if actions_source else []
         action_names = ", ".join(str(action) for action in state_actions) or "continue"
         objective = str(prompt_state.get("objective") or state_config.get("objective") or "Answer the caller's immediate request.")
-        known = json.dumps(slots, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        known = self._safe_json_dumps(slots if isinstance(slots, dict) else {})
         system = "\n".join((
             invariant,
             "RUNTIME CONTEXT (do not mention this context):",

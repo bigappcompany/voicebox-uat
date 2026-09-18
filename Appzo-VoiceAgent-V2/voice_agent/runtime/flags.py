@@ -13,7 +13,7 @@ def _enabled(name: str, default: bool) -> bool:
 @dataclass(frozen=True)
 class RuntimeFlags:
     enable_agent_bundle: bool = True
-    enable_local_retrieval: bool = False
+    enable_local_retrieval: bool = True
     enable_dynamic_endpoints: bool = True
     enable_flux: bool = False
     enable_semantic_spec_reuse: bool = True

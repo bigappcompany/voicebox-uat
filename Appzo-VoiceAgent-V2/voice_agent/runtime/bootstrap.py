@@ -30,6 +30,7 @@ class RuntimeBootstrap:
                     document_id=str(document["id"]),
                     text=str(document["text"]),
                     risk_class=str(document.get("risk_class") or "LOW_PUBLIC"),
+                    questions=tuple(str(item) for item in document.get("questions") or []),
                 )
             )
         call_id = str(call_data.get("call_id") or call_data.get("stream_id") or "unknown-call")

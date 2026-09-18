@@ -1,10 +1,12 @@
-"""Deterministic callback-preference state machine."""
+"""Explicit callback-preference state transitions."""
 
 from __future__ import annotations
 
-import re
+from typing import Any
 
+from ..runtime.intents import CanonicalIntentModel, IntentMatch
 from ..runtime.response_plan import ResponsePlan
+from ..runtime.session import PendingQuestion
 
 
 class CallbackCoordinator:
@@ -15,108 +17,114 @@ class CallbackCoordinator:
     AWAITING_TIME = "AWAITING_TIME"
     PREFERENCE_RECORDED = "PREFERENCE_RECORDED"
 
-    _days = r"today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|next week"
-    _time = (
-        r"(?:at\s+(?:[01]?\d|2[0-3])(?::[0-5]\d)?(?:\s*(?:a\.?\s*m\.?|p\.?\s*m\.?))?"
-        r"|(?:[01]?\d|2[0-3])(?::[0-5]\d)?\s*(?:a\.?\s*m\.?|p\.?\s*m\.?)"
-        r"|(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
-        r"(?:\s+[0-5][0-9])?\s*(?:a\.?\s*m\.?|p\.?\s*m\.?))"
-    )
-
-    def route(self, text: str, slots: dict[str, object]) -> tuple[ResponsePlan, str] | None:
-        normalized = " ".join(re.sub(r"[^\w\s:.]", " ", text.casefold()).split())
+    def route(
+        self,
+        intent: IntentMatch | str,
+        slots: dict[str, object],
+        *,
+        turn_id: int = 0,
+    ) -> tuple[ResponsePlan, str] | None:
         state = str(slots.get("callback_state") or self.IDLE)
-        explicit = bool(re.search(r"\b(?:call me back|callback|follow up|follow-up|arrange a call)\b", normalized))
-        yes = normalized in {"yes", "yes please", "sure", "okay", "ok", "please do", "that works"}
-        no = normalized in {"no", "no thanks", "not now", "not interested", "don't call", "do not call"}
+        if isinstance(intent, str):
+            pending = None
+            if state == self.FOLLOWUP_OFFERED:
+                pending = PendingQuestion("ask_callback_consent", "followup_consent", "boolean")
+            elif state == self.AWAITING_TIME:
+                pending = PendingQuestion("ask_callback_time", "callback_time", "time")
+            elif state == self.AWAITING_DAY:
+                pending = PendingQuestion("ask_callback_day", "callback_day", "date")
+            elif state == self.AWAITING_DAY_TIME:
+                pending = PendingQuestion("ask_callback_day_time", "callback_preference", "date_and_time")
+            intent = CanonicalIntentModel().classify(intent, pending_question=pending)
+        intent_id = intent.intent_id
 
-        if state == self.FOLLOWUP_OFFERED and no:
+        if intent_id == "callback_consent_no" and state == self.FOLLOWUP_OFFERED:
             return self._fixed(
-                "callback-declined",
-                "Understood. I won't record a callback preference. Is there anything else I can help with?",
-                callback_state=self.IDLE,
-                followup_consent="no",
+                "callback_consent_no", "Understood. I won't record a callback preference.",
+                next_state="FOLLOWUP", clear_pending=True,
+                callback_state=self.IDLE, followup_consent="no",
             )
-        if state == self.FOLLOWUP_OFFERED and yes:
+        if intent_id in {"callback_consent_yes", "request_human", "busy"} and state in {
+            self.IDLE, self.FOLLOWUP_OFFERED,
+        }:
             return self._fixed(
-                "callback-consent",
-                "What day and time would be convenient for the follow-up?",
-                callback_state=self.AWAITING_DAY_TIME,
-                followup_consent="yes",
+                "callback_consent_yes" if intent_id == "callback_consent_yes" else intent_id,
+                "What day and time would be convenient?", next_state="CALLBACK",
+                pending=PendingQuestion("ask_callback_day_time", "callback_preference", "date_and_time", turn_id),
+                callback_state=self.AWAITING_DAY_TIME, followup_consent="yes",
             )
-        if explicit and state == self.IDLE:
-            return self._fixed(
-                "callback-request",
-                "What day and time would be convenient for the follow-up?",
-                callback_state=self.AWAITING_DAY_TIME,
-                followup_consent="yes",
-            )
-
-        # A preference has already been captured locally. A subsequent
-        # affirmative response must not fall through to the hosted model,
-        # where it previously produced claims such as "I will connect with
-        # you tomorrow" despite there being no scheduling integration.
-        if state == self.PREFERENCE_RECORDED and yes:
+        if state == self.PREFERENCE_RECORDED and intent_id == "callback_consent_yes":
             preference = str(slots.get("callback_preference") or "your requested time")
             return self._fixed(
-                "callback-preference-acknowledged",
-                f"Thanks. I've recorded {preference} as a requested follow-up time. Our team will confirm availability.",
+                "callback_preference_acknowledged",
+                f"Your requested follow-up time is {preference}. Our team will confirm availability.",
+                next_state="FOLLOWUP", clear_pending=True,
                 callback_state=self.PREFERENCE_RECORDED,
+                route="callback-preference-acknowledged",
             )
 
-        if state not in {self.AWAITING_DAY_TIME, self.AWAITING_DAY, self.AWAITING_TIME, self.FOLLOWUP_OFFERED}:
+        callback_context = state in {
+            self.AWAITING_DAY_TIME, self.AWAITING_DAY, self.AWAITING_TIME, self.FOLLOWUP_OFFERED,
+        }
+        if not callback_context:
             return None
-        day_match = re.search(rf"\b({self._days})\b", normalized)
-        time_match = re.search(rf"\b({self._time})\b", normalized)
-        day = day_match.group(1) if day_match else str(slots.get("callback_day") or "")
-        clock = time_match.group(1) if time_match else str(slots.get("callback_time") or "")
+
+        if intent_id == "clarification" and callback_context:
+            return self._fixed(
+                "callback_clarification",
+                "We can note down your preferred day and time for our team to call you back. What day and time works best for you?",
+                next_state="CALLBACK",
+                pending=PendingQuestion("ask_callback_day_time", "callback_preference", "date_and_time", turn_id),
+                route="callback-preference",
+            )
+
+        day = str(intent.slots.get("callback_day") or slots.get("callback_day") or "").strip()
+        clock = str(intent.slots.get("callback_time") or slots.get("callback_time") or "").strip()
         if day and clock:
             preference = f"{day} at {clock}"
             return self._fixed(
-                "callback-preference",
-                f"I've recorded your preference for {preference}. This is a requested time, not a confirmed booking.",
-                callback_state=self.PREFERENCE_RECORDED,
-                callback_day=day,
-                callback_time=clock,
-                callback_preference=preference,
+                "callback_day_time", f"I've recorded {preference} as your preference, not a confirmed booking.",
+                next_state="FOLLOWUP", clear_pending=True,
+                callback_state=self.PREFERENCE_RECORDED, callback_day=day,
+                callback_time=clock, callback_preference=preference,
+                route="callback-preference",
             )
         if day:
             return self._fixed(
-                "callback-day",
-                f"What time {day} would be convenient?",
-                callback_state=self.AWAITING_TIME,
-                callback_day=day,
+                "callback_day", f"What time {day} would be convenient?", next_state="CALLBACK",
+                pending=PendingQuestion("ask_callback_time", "callback_time", "time", turn_id),
+                callback_state=self.AWAITING_TIME, callback_day=day,
             )
         if clock:
             return self._fixed(
-                "callback-time",
-                f"What day would you prefer for a follow-up at {clock}?",
-                callback_state=self.AWAITING_DAY,
-                callback_time=clock,
+                "callback_time", f"What day would work for a follow-up at {clock}?", next_state="CALLBACK",
+                pending=PendingQuestion("ask_callback_day", "callback_day", "date", turn_id),
+                callback_state=self.AWAITING_DAY, callback_time=clock,
             )
         return None
 
-    def observe_assistant(self, speech: str, slots: dict[str, object]) -> None:
-        if re.search(r"would you like.*(?:follow.?up|callback|call)", speech, re.I):
-            slots["callback_state"] = self.FOLLOWUP_OFFERED
-        elif re.search(r"what time.*(?:convenient|prefer)", speech, re.I):
-            slots["callback_state"] = self.AWAITING_TIME
-            day = re.search(rf"\b({self._days})\b", speech.casefold())
-            if day:
-                slots["callback_day"] = day.group(1)
-        elif re.search(r"what day.*(?:follow.?up|prefer)", speech, re.I):
-            slots["callback_state"] = self.AWAITING_DAY
+    def offer_plan(self, *, turn_id: int) -> ResponsePlan:
+        return ResponsePlan(
+            "fixed", intent_id="offer_callback", next_state="CALLBACK",
+            slots_written={"callback_state": self.FOLLOWUP_OFFERED},
+            pending_question=PendingQuestion("ask_callback_consent", "followup_consent", "boolean", turn_id),
+            allow_speculative_audio=True, booking_authority="preference",
+        )
 
     @staticmethod
-    def _fixed(route: str, speech: str, **writes: str) -> tuple[ResponsePlan, str]:
+    def _fixed(
+        intent_id: str, speech: str, *, next_state: str | None = None,
+        pending: PendingQuestion | None = None, clear_pending: bool = False,
+        route: str = "fixed",
+        **writes: Any,
+    ) -> tuple[ResponsePlan, str]:
         return (
             ResponsePlan(
-                route,
-                intent_id=route,
-                slots_written=writes,
-                allow_speculative_audio=True,
-                booking_authority="preference",
-                material_slots=tuple(sorted(writes)),
+                route, intent_id=intent_id, next_state=next_state,
+                slots_written=writes, pending_question=pending,
+                clear_pending_question=clear_pending, allow_speculative_audio=True,
+                booking_authority="preference", material_slots=tuple(sorted(writes)),
+                decision_reason="callback_state", decision_confidence=.99,
             ),
             speech,
         )

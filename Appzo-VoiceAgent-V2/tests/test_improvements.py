@@ -190,6 +190,37 @@ class ImprovementUnitTests(unittest.TestCase):
         self.assertEqual([item["content"] for item in messages[-3:]], ["recent", "recent answer", "What next?"])
         self.assertGreater(builder.section_token_estimates["total"], 0)
 
+    def test_prompt_builder_safely_serializes_complex_and_typed_slots(self):
+        from voice_agent.flows.facts import NumericRange, FactValue
+        builder = PromptBuilder()
+        complex_slots = {
+            "headcount": NumericRange(5, 10, "people", True),
+            "hiring_timeline": NumericRange(2, 4, "months", False),
+            "fact_provenance": FactValue(value=NumericRange(1, 3), confidence=0.95, source_turn=2, raw_text="1 to 3"),
+            "roles": ["developer", "tester"],
+            "departments": {"eng", "qa"},
+            "mixed_keys": {2: "second", 1: "first", "alpha": "test"},
+            "null_value": None,
+        }
+        # Verify custom actions on agent as list or None as well
+        custom_agent = agent(actions=["transfer", "escalate"])
+        messages = builder.build(
+            agent=custom_agent,
+            state={"name": "FOLLOWUP"},
+            slots=complex_slots,
+            route=ResponsePlan("hosted"),
+            knowledge=[],
+            history=[],
+            user_text="we are hiring",
+        )
+        self.assertIn("KNOWN FACTS:", messages[0]["content"])
+        self.assertIn('"headcount":"about 5-10 people"', messages[0]["content"])
+        self.assertIn('"hiring_timeline":"2-4 months"', messages[0]["content"])
+        self.assertIn('"fact_provenance":"1-3"', messages[0]["content"])
+        self.assertIn('"1":"first"', messages[0]["content"])
+        self.assertIn('"2":"second"', messages[0]["content"])
+        self.assertIn("ALLOWED ACTIONS: transfer, escalate", messages[0]["content"])
+
     def test_master_switch_disables_improvements(self):
         with patch.dict("os.environ", {"ENABLE_V2_IMPROVEMENTS": "false"}, clear=False):
             flags = RuntimeFlags.from_env()

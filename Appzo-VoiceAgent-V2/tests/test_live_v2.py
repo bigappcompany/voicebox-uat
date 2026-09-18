@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 from live_v2 import V2RoutingController
 from voice_agent.agents.bundle import AgentBundle
 from voice_agent.runtime.session import CallSession
+from voice_agent.runtime.session import PendingQuestion
 from pipecat.frames.frames import (
     EndFrame,
     LLMFullResponseEndFrame,
@@ -154,6 +155,7 @@ class LiveRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.controller._commit_final_turn.assert_awaited_once()
 
     async def test_changed_suffix_rejects_speculation(self):
+        self.controller.router.extended = False
         self.client.chat.completions.create.return_value = FakeStream(["Which roles do you need?"])
         await self.controller._on_interim("we need four")
         await self.controller._on_interim("we need four engineers")
@@ -163,6 +165,7 @@ class LiveRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.controller._candidate_matches(candidate, "we need four engineers but not now", plan))
 
     async def test_flux_eager_is_private_and_resume_invalidates(self):
+        self.controller.router.extended = False
         self.controller._flux_mode = True
         self.client.chat.completions.create.return_value = FakeStream(["Which roles do you need?"])
         await self.controller._on_interim("we need four engineers")
@@ -201,7 +204,10 @@ class LiveRoutingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_punctuated_callback_time_is_local(self):
         from main import normalize
-        self.controller.session.history = [{"role": "assistant", "content": "What time tomorrow is convenient?"}]
+        self.controller.session.slots["callback_state"] = "AWAITING_DAY_TIME"
+        self.controller.session.pending_question = PendingQuestion(
+            "ask_callback_day_time", "callback_preference", "date_and_time", 0
+        )
         state = await self.answer(normalize("Okay, three p.m. tomorrow please."))
         self.assertEqual(state.metrics.route, "v2-callback-preference")
         self.client.chat.completions.create.assert_not_awaited()
@@ -214,7 +220,10 @@ class LiveRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("The Hiring Company", self.controller.push_frame.await_args.args[0].text)
 
     async def test_callback_preference_does_not_call_model_or_claim_booking(self):
-        self.controller.session.history = [{"role": "assistant", "content": "What time would be convenient?"}]
+        self.controller.session.slots["callback_state"] = "AWAITING_DAY_TIME"
+        self.controller.session.pending_question = PendingQuestion(
+            "ask_callback_day_time", "callback_preference", "date_and_time", 0
+        )
         state = await self.answer("tomorrow two pm afternoon")
         self.assertEqual(state.metrics.route, "v2-callback-preference")
         self.client.chat.completions.create.assert_not_awaited()
@@ -258,6 +267,7 @@ class LiveRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(released.is_set())
 
     async def test_stable_interim_response_is_released_only_after_matching_hard_eot(self):
+        self.controller.router.extended = False
         self.client.chat.completions.create.return_value = FakeStream(["We can help you hire engineers."])
         await self.controller._on_interim("we need four")
         await self.controller._on_interim("we need four engineers")
@@ -290,6 +300,7 @@ class LiveRoutingTests(unittest.IsolatedAsyncioTestCase):
                     choices=[SimpleNamespace(delta=SimpleNamespace(content="Which roles do you need?"))]
                 )
 
+        self.controller.router.extended = False
         self.client.chat.completions.create.return_value = GatedStream([])
         await self.controller._on_interim("we need four")
         await self.controller._on_interim("we need four engineers")
@@ -332,6 +343,7 @@ class LiveRoutingTests(unittest.IsolatedAsyncioTestCase):
                     choices=[SimpleNamespace(delta=SimpleNamespace(content="We can help with that."))]
                 )
 
+        self.controller.router.extended = False
         self.client.chat.completions.create.return_value = DelayedFirstPhrase([])
         await self.controller._on_interim("we need four")
         await self.controller._on_interim("we need four engineers")
@@ -368,6 +380,7 @@ class LiveRoutingTests(unittest.IsolatedAsyncioTestCase):
             async def close(self):
                 pass
 
+        self.controller.router.extended = False
         self.controller._spec_audio = PrivateCartesia()
         self.client.chat.completions.create.return_value = FakeStream(["We can help you hire engineers."])
         await self.controller._on_interim("we need four")
@@ -392,3 +405,50 @@ class LiveRoutingTests(unittest.IsolatedAsyncioTestCase):
         for call in connect.await_args_list:
             self.assertNotIn("api_key", call.args[0])
             self.assertEqual(call.kwargs["additional_headers"], {"X-API-Key": "test"})
+
+    async def test_turn13_followup_with_numeric_range_slots_does_not_raise_typeerror(self):
+        from voice_agent.flows.facts import NumericRange
+        self.controller.session.state = {"name": "FOLLOWUP"}
+        self.controller.session.pending_question = PendingQuestion(
+            "ask_callback_consent", "followup_consent", "boolean", 12
+        )
+        self.controller.session.slots = {
+            "hiring_status": "yes",
+            "roles": ["developer"],
+            "headcount": NumericRange(5, 10, "people", True),
+            "hiring_timeline": NumericRange(1, 2, "months", False),
+            "callback_state": "FOLLOWUP_OFFERED",
+        }
+        self.client.chat.completions.create.return_value = FakeStream(["We would be glad to help."])
+        # Trigger eager candidate speculation (turn 13)
+        await self.controller._start_candidate(self.controller._state, "we are hiring", source="eager")
+        candidate = self.controller._state.candidate
+        self.assertIsNotNone(candidate)
+        await candidate.task
+        self.assertTrue(candidate.completed)
+        self.assertEqual(candidate.answer_text, "We would be glad to help.")
+        # Trigger final turn commitment
+        self.controller._state.final_transcript = "we are hiring"
+        await self.controller._commit_final_turn(self.controller._state)
+        self.assertNotEqual(self.controller._state.metrics.route, "v2-error")
+        self.assertIn("We would be glad to help.", [call.args[0].text for call in self.controller.push_frame.await_args_list if isinstance(call.args[0], LLMTextFrame)])
+
+    async def test_turn13_followup_non_speculative_with_numeric_range_slots_does_not_raise_typeerror(self):
+        from voice_agent.flows.facts import NumericRange
+        self.controller.session.state = {"name": "FOLLOWUP"}
+        self.controller.session.pending_question = PendingQuestion(
+            "ask_callback_consent", "followup_consent", "boolean", 12
+        )
+        self.controller.session.slots = {
+            "hiring_status": "yes",
+            "roles": ["developer"],
+            "headcount": NumericRange(5, 10, "people", True),
+            "hiring_timeline": NumericRange(1, 2, "months", False),
+            "callback_state": "FOLLOWUP_OFFERED",
+        }
+        self.client.chat.completions.create.return_value = FakeStream(["We would be glad to help."])
+        state = await self.answer("we are hiring")
+        self.assertNotEqual(state.metrics.route, "v2-error")
+        self.assertEqual(state.metrics.route, "v2-hosted")
+        self.assertIn("We would be glad to help.", [call.args[0].text for call in self.controller.push_frame.await_args_list if isinstance(call.args[0], LLMTextFrame)])
+

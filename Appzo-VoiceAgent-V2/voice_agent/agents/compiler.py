@@ -55,40 +55,139 @@ class AgentCompiler:
         profile_name = str(fact_profile.get("name") or payload.get("runtime_profile") or agent.get("runtime_profile") or "").strip()
         if profile_name:
             fact_profile = {**fact_profile, "name": profile_name}
+        is_recruitment = profile_name.casefold() == "recruitment" or bool(
+            re.search(r"\b(?:hiring|staffing|recruit(?:ment|ing)?)\b", system, re.I)
+        )
+        if is_recruitment and not profile_name:
+            fact_profile = {**fact_profile, "name": "recruitment"}
+        company_name = str(payload.get("company_name") or agent.get("company_name") or "The Hiring Company")
+        assistant_name = str(agent.get("name") or "Riya")
+        defaults = self._recruitment_defaults() if is_recruitment else {}
         raw_knowledge = (
             payload.get("knowledge_profile")
             or payload.get("knowledge_documents")
+            or payload.get("faqs")
             or agent.get("knowledge_profile")
             or agent.get("knowledge_documents")
+            or agent.get("faqs")
             or []
         )
         knowledge_profile = self._knowledge_profile(raw_knowledge, version)
+        if not knowledge_profile.get("documents"):
+            knowledge_profile = self._knowledge_profile(
+                self._faq_pairs_from_prompt(system), version
+            )
+        explicit_routing = payload.get("routing_policy") or agent.get("routing_policy") or {}
+        routing_policy = self._deep_merge(defaults.get("routing_policy", {}), explicit_routing)
+        routing_policy = {"model": model.get("model"), "provider": model.get("provider"), **routing_policy}
+        cached_utterances = {
+            **defaults.get("cached_utterances", {}),
+            **(agent.get("cached_utterances") or payload.get("cached_utterances") or {}),
+        }
+        cached_utterances = {
+            key: str(value).replace("The Hiring Company", company_name).replace("Riya", assistant_name)
+            for key, value in cached_utterances.items()
+        }
+        explicit_flow = agent.get("flow_graph") or payload.get("flow_graph") or {}
+        flow_graph = self._deep_merge(defaults.get("flow_graph", {}), explicit_flow)
+        if not flow_graph:
+            flow_graph = {"initial_state": "OPEN", "states": {"OPEN": {}}}
+        slot_schema = self._deep_merge(
+            defaults.get("slot_schema", {}), agent.get("slot_schema") or payload.get("slot_schema") or {},
+        )
+        base_keyterms = list(defaults.get("keyterms", []))
+        base_keyterms.append(company_name)
+        aliases = fact_profile.get("role_aliases") or {}
+        if isinstance(aliases, dict):
+            base_keyterms.extend(str(name) for name in aliases)
+        configured_keyterms = list(transcriber.get("keyterms") or [])
+        state_keyterms = defaults.get("state_keyterms", {})
         return AgentBundle(
             agent_id=agent_id, version=version, tenant_id=tenant_id,
             identity={
-                "name": agent.get("name", "assistant"),
-                "company_name": payload.get("company_name") or agent.get("company_name") or "The Hiring Company",
+                "name": assistant_name,
+                "company_name": company_name,
             }, invariant_prompt=system,
             language_profile={"primary": payload.get("primary_language", "multi")},
-            flow_graph=agent.get("flow_graph") or payload.get("flow_graph") or {"initial_state": "OPEN", "states": {"OPEN": {}}},
+            flow_graph=flow_graph,
             state_schema=agent.get("state_schema") or payload.get("state_schema") or {},
-            slot_schema=agent.get("slot_schema") or payload.get("slot_schema") or {},
+            slot_schema=slot_schema,
             actions=agent.get("actions") or payload.get("actions") or {},
             risk_policy=agent.get("risk_policy") or payload.get("risk_policy") or {"class": "LOW_PUBLIC"},
-            routing_policy={
-                "model": model.get("model"),
-                "provider": model.get("provider"),
-                **(payload.get("routing_policy") or agent.get("routing_policy") or {}),
-            },
+            routing_policy=routing_policy,
             stt_profile={"model": transcriber.get("model", "nova-3"), "endpointing": transcriber.get("endpointing"),
-                         "keyterms": transcriber.get("keyterms") or []},
+                         "keyterms": list(dict.fromkeys([*configured_keyterms, *base_keyterms])),
+                         "state_keyterms": state_keyterms,
+                         "language_hints": transcriber.get("language_hints") or ["en", "hi"]},
             tts_profile={"model": synthesizer.get("model", "sonic-3.5"), "voice_id": synthesizer.get("voice_id")},
             knowledge_profile=knowledge_profile,
-            cached_utterances=(agent.get("cached_utterances") or payload.get("cached_utterances") or {}),
+            cached_utterances=cached_utterances,
             compiled_prompt=dict(runtime_prompt),
             fact_profile=fact_profile,
-            cache_policy=dict(payload.get("cache_policy") or agent.get("cache_policy") or {}),
+            cache_policy={
+                "namespace": f"{tenant_id}:{version}:{payload.get('primary_language', 'multi')}",
+                **dict(payload.get("cache_policy") or agent.get("cache_policy") or {}),
+            },
         )
+
+    @staticmethod
+    def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+        result = dict(base or {})
+        for key, value in dict(override or {}).items():
+            if isinstance(value, dict) and isinstance(result.get(key), dict):
+                result[key] = AgentCompiler._deep_merge(result[key], value)
+            else:
+                result[key] = value
+        return result
+
+    @staticmethod
+    def _recruitment_defaults() -> dict[str, Any]:
+        states = {
+            "OPENING": {"objective": "identify the call purpose", "required_slots": ["hiring_status"], "endpoint_profile": "yes_no"},
+            "HIRING_STATUS": {"objective": "learn current or future hiring status", "required_slots": ["hiring_status"], "endpoint_profile": "yes_no"},
+            "REQUIREMENTS": {"objective": "collect only missing hiring facts", "required_slots": ["roles", "headcount", "hiring_timeline"], "endpoint_profile": "requirements"},
+            "FOLLOWUP": {"objective": "offer a human follow-up without promising a booking", "required_slots": ["followup_consent"], "endpoint_profile": "yes_no"},
+            "CALLBACK": {"objective": "record callback day and time preferences", "required_slots": ["callback_day", "callback_time"], "endpoint_profile": "short_entity"},
+            "CLOSING": {"objective": "close politely", "required_slots": [], "endpoint_profile": "freeform"},
+        }
+        return {
+            "flow_graph": {"initial_state": "OPENING", "states": states},
+            "slot_schema": {
+                "hiring_status": {"type": "string", "enum": ["yes", "no", "future", "unknown"]},
+                "roles": {"type": "string"}, "departments": {"type": "string"},
+                "headcount": {"type": "string"}, "hiring_timeline": {"type": "string"},
+                "followup_consent": {"type": "string", "enum": ["yes", "no"]},
+                "callback_day": {"type": "string"}, "callback_time": {"type": "string"},
+                "callback_preference": {"type": "string"}, "callback_state": {"type": "string"},
+            },
+            "cached_utterances": {
+                "greeting": "Hello, I'm Riya from The Hiring Company.",
+                "ask:hiring_status": "Are you hiring now or in the next few months?",
+                "ask:roles": "What roles are you planning to hire for?",
+                "ask:headcount": "Roughly how many people would you need?",
+                "ask:hiring_timeline": "What hiring timeline are you targeting?",
+                "ask:callback_day": "What day would work best?",
+                "ask:callback_time": "What time would be convenient?",
+                "model-identity": "I'm an AI voice assistant for The Hiring Company.",
+                "out-of-scope": "I can only help with hiring and staffing on this call.",
+                "goodbye": "Thank you for your time. Goodbye.",
+            },
+            "routing_policy": {
+                "intent_patterns": {
+                    "request_human": ["speak to someone", "talk to a person", "talent acquisition manager"],
+                    "faq_services": ["what services", "blue collar", "white collar", "job types"],
+                    "out_of_scope": ["reverse the linked list", "technical issue"],
+                }
+            },
+            "keyterms": [
+                "The Hiring Company", "Talent Acquisition", "operations", "technology",
+                "staffing", "permanent", "contract", "temporary", "apprenticeship", "NAPS", "NATS",
+            ],
+            "state_keyterms": {
+                "REQUIREMENTS": ["operations", "technology", "engineering", "finance", "sales", "headcount"],
+                "CALLBACK": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "AM", "PM"],
+            },
+        }
 
     @staticmethod
     def _compile_runtime_invariant(source: str) -> str:
@@ -147,9 +246,14 @@ class AgentCompiler:
         """
         profile = dict(raw) if isinstance(raw, dict) else {"documents": raw}
         documents = profile.get("documents") or profile.get("records") or profile.get("items") or []
+        if isinstance(raw, dict) and not documents and not ({"version", "documents", "records", "items"} & set(raw)):
+            documents = [
+                {"id": f"faq-{index + 1}", "question": question, "answer": answer}
+                for index, (question, answer) in enumerate(raw.items())
+            ]
         if isinstance(documents, (str, bytes)):
             documents = [documents]
-        normalized: list[dict[str, str]] = []
+        normalized: list[dict[str, Any]] = []
         for index, document in enumerate(documents if isinstance(documents, list) else []):
             if isinstance(document, str):
                 text, document_id, risk = document.strip(), f"doc-{index + 1}", "LOW_PUBLIC"
@@ -160,7 +264,34 @@ class AgentCompiler:
             else:
                 continue
             if text:
-                normalized.append({"id": document_id, "text": text, "risk_class": risk})
+                questions = (
+                    document.get("questions") or document.get("aliases")
+                    or document.get("question") or []
+                ) if isinstance(document, dict) else []
+                if isinstance(questions, str):
+                    questions = [questions]
+                normalized.append({
+                    "id": document_id, "text": text, "risk_class": risk,
+                    "questions": [str(item) for item in questions if str(item).strip()],
+                })
         profile["version"] = str(profile.get("version") or version)
         profile["documents"] = normalized
         return profile
+
+    @staticmethod
+    def _faq_pairs_from_prompt(source: str) -> list[dict[str, Any]]:
+        """Extract only explicit Q/A authoring blocks; never invent knowledge."""
+        pairs: list[dict[str, Any]] = []
+        pattern = re.compile(
+            r"(?:^|\n)\s*(?:Q(?:uestion)?\s*[:.-])\s*(?P<question>[^\n]+)\n"
+            r"\s*(?:A(?:nswer)?\s*[:.-])\s*(?P<answer>[^\n]+)",
+            re.I,
+        )
+        for index, match in enumerate(pattern.finditer(source)):
+            pairs.append({
+                "id": f"faq-{index + 1}",
+                "questions": [match.group("question").strip()],
+                "text": match.group("answer").strip(),
+                "risk_class": "LOW_PUBLIC",
+            })
+        return pairs

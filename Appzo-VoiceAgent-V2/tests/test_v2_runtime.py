@@ -15,6 +15,7 @@ from voice_agent.speech.audio_commit import AudioCommitter, SpeculativeAudioCand
 from voice_agent.speech.safe_chunker import SafeSpeechChunker
 from voice_agent.flows.slots import SlotValidator
 from voice_agent.flows.engine import FlowEngine
+from voice_agent.flows.facts import NumericRange
 
 
 def bundle(*, risk="LOW_PUBLIC"):
@@ -112,6 +113,24 @@ class V2RuntimeTests(unittest.TestCase):
         agent = bundle(); agent = AgentBundle(**{**agent.__dict__, "actions": {"ASK": {}}, "flow_graph": {"huge": "ignored"}})
         messages = PromptBuilder(max_knowledge_chars=10).build(agent=agent, state={"name": "OPEN"}, slots={}, route=ResponsePlan("llm"), knowledge=["x" * 50], history=[], user_text="hello")
         self.assertEqual(messages[-1]["content"], "hello"); self.assertLessEqual(len(messages[1]["content"]), len("RELEVANT KNOWLEDGE:\n") + 10)
+
+    def test_prompt_builder_serializes_structured_slot_values_safely(self):
+        agent = bundle()
+        slots = {
+            "headcount": NumericRange(3, 4, "people", True),
+            "hiring_timeline": NumericRange(3, 4, "months"),
+            "roles": ["operations"],
+            "headcount_by_role": {"operations": NumericRange(3, 4, "people", True)},
+            "tags": {"urgent", "remote"},
+        }
+        messages = PromptBuilder().build(
+            agent=agent, state={"name": "OPEN"}, slots=slots,
+            route=ResponsePlan("llm"), knowledge=[], history=[], user_text="hello",
+        )
+        self.assertIn('"headcount":"about 3-4 people"', messages[0]["content"])
+        self.assertIn('"hiring_timeline":"3-4 months"', messages[0]["content"])
+        self.assertIn('"roles":["operations"]', messages[0]["content"])
+
 
     def test_slot_validator_enforces_compiled_type_bounds_and_enums(self):
         validator = SlotValidator()

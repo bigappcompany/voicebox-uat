@@ -34,7 +34,9 @@ from voice_agent.flows.callbacks import CallbackCoordinator
 from voice_agent.routing.deterministic import DeterministicRouter
 from voice_agent.runtime.fingerprints import ResponseFingerprint
 from voice_agent.runtime.flags import RuntimeFlags
+from voice_agent.runtime.intents import CanonicalIntentModel
 from voice_agent.runtime.response_plan import ResponsePlan
+from voice_agent.runtime.session import PendingQuestion
 from voice_agent.speech.safe_chunker import SafeSpeechChunker
 from voice_agent.speech.speculative_cartesia import SpeculativeCartesiaBuffer
 from voice_agent.speech.stream_filter import SpeechStreamFilter
@@ -63,6 +65,7 @@ class V2RoutingController(StreamingVoiceController):
         self._flux_eager = False
         self._closed_flux_turns = set()
         self.router = DeterministicRouter(extended=self.flags.enable_extended_deterministic_routing)
+        self.intent_model = CanonicalIntentModel()
         self.flow_engine = FlowEngine()
         self.slot_validator = SlotValidator()
         profile_name = str(session.agent.fact_profile.get("name") or os.getenv("V2_FACT_PROFILE", "recruitment"))
@@ -101,13 +104,18 @@ class V2RoutingController(StreamingVoiceController):
         ) / 1000
         self._stable_interim_secs = float(os.getenv("V2_STABLE_INTERIM_MS", "80")) / 1000
         self._spec_max_restarts = int(os.getenv("V2_SPECULATION_MAX_RESTARTS", "2"))
-        # These defaults intentionally wait for a compact clause.  The former
-        # 20-character / three-word / 80-ms threshold handed Cartesia tiny
-        # continuations, exposing any later model-token delay as audible
-        # word-by-word speech.
-        self._safe_chunk_chars = int(os.getenv("V2_SAFE_CHUNK_CHARS", "48"))
-        self._safe_chunk_words = int(os.getenv("V2_SAFE_CHUNK_WORDS", "7"))
-        self._safe_chunk_max_wait_ms = int(os.getenv("V2_SAFE_CHUNK_MAX_WAIT_MS", "240"))
+        chunk_profiles = {
+            "fast": (32, 5, 160),
+            "balanced": (40, 5, 200),
+            "natural": (48, 7, 240),
+        }
+        self._safe_chunk_profile = os.getenv("V2_SAFE_CHUNK_PROFILE", "natural").casefold()
+        default_chars, default_words, default_wait = chunk_profiles.get(
+            self._safe_chunk_profile, chunk_profiles["natural"]
+        )
+        self._safe_chunk_chars = int(os.getenv("V2_SAFE_CHUNK_CHARS", str(default_chars)))
+        self._safe_chunk_words = int(os.getenv("V2_SAFE_CHUNK_WORDS", str(default_words)))
+        self._safe_chunk_max_wait_ms = int(os.getenv("V2_SAFE_CHUNK_MAX_WAIT_MS", str(default_wait)))
         self._min_final_transcript_chars = int(os.getenv("V2_MIN_FINAL_TRANSCRIPT_CHARS", "2"))
         self._spec_restart_min_new_words = int(os.getenv("V2_SPEC_RESTART_MIN_NEW_WORDS", "3"))
         self._spec_tts_commit_wait_secs = float(os.getenv("V2_SPEC_TTS_COMMIT_WAIT_MS", "40")) / 1000
@@ -129,6 +137,11 @@ class V2RoutingController(StreamingVoiceController):
             self._spec_audio.warm()
         elif self._enable_spec_tts and self._streaming:
             logger.warning("V2 speculative TTS is enabled but Cartesia runtime settings are incomplete")
+        logger.info(
+            "V2 SAFE CHUNK PROFILE | name={} min_chars={} min_words={} max_wait_ms={}",
+            self._safe_chunk_profile, self._safe_chunk_chars,
+            self._safe_chunk_words, self._safe_chunk_max_wait_ms,
+        )
 
     async def process_frame(self, frame, direction):
         if direction == FrameDirection.DOWNSTREAM and self._flux_mode:
@@ -238,6 +251,23 @@ class V2RoutingController(StreamingVoiceController):
 
         if self._spec_audio:
             self._spec_audio.warm()
+        provisional = (
+            self.fact_extractor.extract(
+                basis, self.session.slots,
+                pending_question=self.session.pending_question,
+                source_turn=state.turn_id,
+            )
+            if self.flags.enable_structured_facts else None
+        )
+        provisional_facts = provisional.values if provisional else {}
+        provisional_slots = {**self.session.visible_facts(), **provisional_facts}
+        plan, speech = self._response_plan(
+            basis, slots=provisional_slots, pending_question=self.session.pending_question,
+            current_facts=provisional_facts,
+        )
+        if speech is not None or plan.risk_class not in {"LOW_PUBLIC", "LOW_WORKFLOW"} or plan.tool_name:
+            return
+        fingerprint = self._fingerprint(basis, plan, slots=provisional_slots)
         old = state.candidate
         if old and old.transcript == basis and (
             old.completed or (old.task is not None and not old.task.done())
@@ -246,28 +276,42 @@ class V2RoutingController(StreamingVoiceController):
                 old.v2_source = "eager"
                 await self._start_existing_spec_audio(state, old)
             return
+        if (
+            old and source == "eager" and basis.startswith(old.transcript + " ")
+            and getattr(old, "v2_fingerprint", None) == fingerprint
+        ):
+            old.v2_source = "eager"
+            await self._start_existing_spec_audio(state, old)
+            return
         if old and old.task is not None and not old.task.done() and basis.startswith(old.transcript + " "):
             new_words = len(basis.split()) - len(old.transcript.split())
             if source != "eager" and new_words < self._spec_restart_min_new_words:
                 return
         self._cancel_task(old.task if old else None)
         await self._abort_spec_audio(old)
-        provisional = self.fact_extractor.extract(basis, self.session.slots) if self.flags.enable_structured_facts else None
-        provisional_slots = {**self.session.slots, **(provisional.values if provisional else {})}
-        plan, speech = self._response_plan(basis)
-        if provisional_slots:
-            plan = replace(plan, material_slots=tuple(sorted(provisional_slots)))
-        if speech is not None or plan.risk_class not in {"LOW_PUBLIC", "LOW_WORKFLOW"} or plan.tool_name:
-            return
 
         candidate = LLMRequest(basis, speculative=True)
         candidate.v2_plan = plan
         candidate.v2_slots = provisional_slots
         candidate.v2_source = source
-        candidate.v2_fingerprint = self._fingerprint(basis, plan, slots=provisional_slots)
+        candidate.v2_fingerprint = fingerprint
         state.candidate = candidate
         state.speculation_restarts += 1
         state.metrics.speculative_started_at = time.perf_counter()
+        state.metrics.stable_candidate_source = source
+        if source == "stable" and state.metrics.stable_candidate_started_at is None:
+            state.metrics.stable_candidate_started_at = state.metrics.speculative_started_at
+        state.metrics.spec_tts_eligible = bool(self._spec_audio and plan.may_prepare_audio())
+        state.metrics.spec_tts = (
+            "waiting_for_eager_eot" if state.metrics.spec_tts_eligible and source == "stable"
+            else "waiting_for_safe_text" if state.metrics.spec_tts_eligible
+            else "not_eligible"
+        )
+        state.metrics.spec_tts_reason = (
+            "stable_candidate_waiting_for_eager_eot" if state.metrics.spec_tts == "waiting_for_eager_eot"
+            else "safe_text_not_ready" if state.metrics.spec_tts == "waiting_for_safe_text"
+            else "plan_or_private_tts_ineligible"
+        )
         state.metrics.llm_request_started_at = None
         state.metrics.llm_stream_opened_at = None
         state.metrics.llm_first_token_at = None
@@ -394,14 +438,42 @@ class V2RoutingController(StreamingVoiceController):
         self.session.turn_id = state.turn_id
         text = state.final_transcript
         if self.flags.enable_structured_facts:
-            facts = self.fact_extractor.extract(text, self.session.slots)
+            facts = self.fact_extractor.extract(
+                text, self.session.visible_facts(),
+                pending_question=self.session.pending_question,
+                source_turn=state.turn_id,
+            )
             self.session.slots.update(facts.values)
+            self.session.facts.update(facts.records)
             if facts.corrected:
                 logger.info("V2 FACT correction fields={}", ",".join(facts.corrected))
         if self._transcript_callback:
             self._transcript_callback("user", text)
 
-        plan, speech = self._response_plan(text)
+        current_facts = facts.values if self.flags.enable_structured_facts else {}
+        plan, speech = self._response_plan(
+            text, slots=self.session.visible_facts(), pending_question=self.session.pending_question,
+            current_facts=current_facts,
+        )
+        state.metrics.decision_route = plan.route
+        state.metrics.decision_intent = plan.intent_id or "unknown"
+        state.metrics.decision_reason = plan.decision_reason
+        state.metrics.knowledge_direct_hit = plan.route == "faq-direct"
+        if state.metrics.spec_tts == "none":
+            state.metrics.spec_tts_eligible = bool(
+                speech is None and self._spec_audio and plan.may_prepare_audio()
+            )
+            state.metrics.spec_tts = "miss" if state.metrics.spec_tts_eligible else "not_eligible"
+            state.metrics.spec_tts_reason = (
+                "no_stable_candidate" if state.metrics.spec_tts_eligible
+                else "deterministic_or_private_tts_unavailable"
+            )
+        logger.info(
+            "V2 DECISION | turn={} route={} intent={} confidence={} reason={} state={}",
+            state.turn_id, plan.route, plan.intent_id or "unknown",
+            round(plan.decision_confidence, 3), plan.decision_reason or "fallback",
+            self.session.state.get("name"),
+        )
         candidate = state.candidate
         if self._candidate_matches(candidate, text, plan):
             state.metrics.candidate_validated_at = time.perf_counter()
@@ -420,6 +492,8 @@ class V2RoutingController(StreamingVoiceController):
             else:
                 state.metrics.route = "v2-speculation-hit"
                 state.metrics.speculation = "hit"
+                state.metrics.semantic_spec_reused = normalize(candidate.transcript) != normalize(text)
+                state.metrics.hosted_llm_used = True
                 logger.info("V2 ROUTE turn={} route=speculation-hit action={} state={}", state.turn_id, plan.action, self.session.state.get("name"))
                 pcm = await self._commit_spec_audio(candidate, self._fingerprint(text, plan))
                 if pcm:
@@ -445,61 +519,119 @@ class V2RoutingController(StreamingVoiceController):
             await self._deliver(state, speech, plan)
             return
         request = LLMRequest(text, speculative=False)
+        request.v2_plan = plan
+        request.v2_slots = self.session.visible_facts()
+        state.metrics.hosted_llm_used = True
         state.final_request = request
         request.task = asyncio.create_task(self._generate(state, text, plan, request=request))
 
-    def _response_plan(self, text: str) -> tuple[ResponsePlan, str | None]:
-        if self.flags.enable_callback_state_machine and self.session.history:
-            last = self.session.history[-1]
-            if last.get("role") == "assistant":
-                self.callback_coordinator.observe_assistant(last.get("content", ""), self.session.slots)
-        routed = self.callback_coordinator.route(text, self.session.slots) if self.flags.enable_callback_state_machine else None
+    def _response_plan(
+        self, text: str, *, slots: dict | None = None, pending_question=None,
+        current_facts: dict | None = None,
+    ) -> tuple[ResponsePlan, str | None]:
+        slots = dict(slots or self.session.visible_facts())
+        pending_question = pending_question if pending_question is not None else self.session.pending_question
+        callback_state = str(slots.get("callback_state") or CallbackCoordinator.IDLE)
+        if pending_question is None:
+            callback_pending = {
+                CallbackCoordinator.FOLLOWUP_OFFERED: ("ask_callback_consent", "followup_consent", "boolean"),
+                CallbackCoordinator.AWAITING_DAY_TIME: ("ask_callback_day_time", "callback_preference", "date_and_time"),
+                CallbackCoordinator.AWAITING_DAY: ("ask_callback_day", "callback_day", "date"),
+                CallbackCoordinator.AWAITING_TIME: ("ask_callback_time", "callback_time", "time"),
+                CallbackCoordinator.PREFERENCE_RECORDED: ("ask_callback_consent", "followup_consent", "boolean"),
+            }.get(callback_state)
+            if callback_pending:
+                pending_question = PendingQuestion(*callback_pending, self.session.turn_id)
+        patterns = self.session.agent.routing_policy.get("intent_patterns") or {}
+        intent = self.intent_model.classify(
+            text, pending_question=pending_question, fact_values=slots,
+            configured_patterns=patterns,
+            current_facts=current_facts,
+        )
+        routed = (
+            self.callback_coordinator.route(intent, slots, turn_id=self.session.turn_id)
+            if self.flags.enable_callback_state_machine else None
+        )
         if routed is None:
-            routed = self.router.route(text, self.session.agent)
-        if self._company_name and text in {
-            "where are you calling from", "okay where are you calling from", "sorry from where",
-            "which company", "what company", "who is this", "who are you", "who is calling",
-        }:
-            routed = (
-                ResponsePlan("identity", intent_id="identity", allow_speculative_audio=True),
-                f"I'm Riya, calling from {self._company_name} about your hiring plans.",
+            routed = self.router.route(
+                text, self.session.agent, intent=intent, slots=slots,
+                pending_question=pending_question, turn_id=self.session.turn_id,
             )
         risk = str(self.session.agent.risk_policy.get("class", "LOW_PUBLIC"))
-        if routed and routed[0].route == "cache" and risk != "LOW_PUBLIC":
+        if routed and routed[0].route in {"cache", "faq-direct"} and risk != "LOW_PUBLIC":
             routed = None
         if routed:
             plan, speech = routed
+            if plan.intent_id == "company_identity" and self._company_name:
+                speech = f"I'm calling from {self._company_name} about your hiring plans."
         else:
-            intent = self._configured_intent(text)
-            if intent:
+            configured_intent = self._configured_intent(text)
+            if configured_intent:
                 plan = self.flow_engine.plan(
                     self.session.agent.flow_graph,
                     str(self.session.state.get("name", "OPEN")),
-                    intent,
-                    self.session.slots,
+                    configured_intent,
+                    slots,
                     risk_class=risk,
+                )
+                plan = replace(
+                    plan, decision_reason=intent.reason,
+                    decision_confidence=intent.confidence,
+                    material_slots=self._material_slots(intent.intent_id, slots),
                 )
                 speech = None
             else:
                 callback_sensitive = bool(
                     re.search(r"\b(?:book|schedule|appointment|callback|follow.?up)\b", text, re.I)
-                    or self.session.slots.get("callback_state") not in {None, "", CallbackCoordinator.IDLE}
+                    or slots.get("callback_state") not in {None, "", CallbackCoordinator.IDLE}
                 )
                 plan, speech = (
                     ResponsePlan(
                         "hosted",
-                        intent_id=None,
+                        intent_id=intent.intent_id,
                         risk_class=risk,
                         allow_speculative_audio=risk in {"LOW_PUBLIC", "LOW_WORKFLOW"},
                         requires_booking_guard=callback_sensitive,
-                        material_slots=tuple(sorted(self.session.slots)),
+                        material_slots=self._material_slots(intent.intent_id, slots),
+                        decision_reason=intent.reason,
+                        decision_confidence=intent.confidence,
                     ),
                     None,
                 )
-        documents = self._knowledge_for(text, plan)
-        if documents:
-            plan = replace(plan, knowledge_ids=tuple(document.document_id for document in documents))
+        matches = self._knowledge_matches(text, plan)
+        if speech is None and matches:
+            top = matches[0]
+            threshold = float(self.session.agent.routing_policy.get("knowledge_direct_threshold", .78))
+            if top.confidence >= threshold and top.record.risk_class == "LOW_PUBLIC":
+                plan = replace(
+                    plan, route="faq-direct", intent_id=plan.intent_id if plan.intent_id != "unknown" else "faq_services",
+                    knowledge_ids=(top.record.document_id,), allow_speculative_audio=True,
+                    decision_reason=f"knowledge:{top.reason}", decision_confidence=top.confidence,
+                )
+                speech = top.record.text
+            else:
+                plan = replace(plan, knowledge_ids=tuple(item.record.document_id for item in matches))
         return plan, speech
+
+    @staticmethod
+    def _material_slots(intent_id: str, slots: dict) -> tuple[str, ...]:
+        requirements = (
+            "hiring_status", "roles", "departments", "headcount",
+            "headcount_by_role", "hiring_timeline",
+        )
+        mapping = {
+            "provide_hiring_status": requirements,
+            "provide_role": requirements,
+            "provide_headcount": requirements,
+            "provide_timeline": requirements,
+            "correction": requirements,
+            "callback_consent_yes": ("followup_consent",),
+            "callback_day": ("callback_day",),
+            "callback_time": ("callback_time",),
+            "callback_day_time": ("callback_day", "callback_time"),
+        }
+        names = mapping.get(intent_id, ())
+        return tuple(name for name in names if name in slots)
 
     def _configured_intent(self, text: str) -> str | None:
         """Match only tenant-authored phrases; never infer a flow from prose."""
@@ -516,16 +648,23 @@ class V2RoutingController(StreamingVoiceController):
 
     def _knowledge_for(self, text: str, plan: ResponsePlan):
         """Use only the call-start tenant index; never retrieve in the cloud hot path."""
+        return [match.record for match in self._knowledge_matches(text, plan)]
+
+    def _knowledge_matches(self, text: str, plan: ResponsePlan):
+        """Return ranked tenant-local knowledge matches with confidence."""
         index = self.session.knowledge_index
-        if index is None or plan.risk_class.startswith("HIGH_"):
+        if (
+            not self.flags.enable_local_retrieval or index is None
+            or plan.risk_class.startswith("HIGH_")
+        ):
             return []
-        documents = index.search(
+        matches = index.search_matches(
             tenant_id=self.session.tenant_id,
             agent_id=self.session.agent.agent_id,
             knowledge_version=self.session.agent.knowledge_version,
             query=text,
         )
-        return [document for document in documents if not document.risk_class.startswith("HIGH_")]
+        return [item for item in matches if not item.record.risk_class.startswith("HIGH_")]
 
     def _fingerprint(self, text: str, plan: ResponsePlan, *, slots: dict | None = None) -> str:
         # The prefix check below ensures generic hosted turns cannot reuse a
@@ -552,7 +691,11 @@ class V2RoutingController(StreamingVoiceController):
         final_words = normalize(final_text).split()
         if not basis_words:
             return False
-        if self.flags.enable_semantic_spec_reuse and final_plan.intent_id:
+        if (
+            self.flags.enable_semantic_spec_reuse
+            and final_plan.intent_id not in {None, "", "unknown"}
+            and candidate_plan.intent_id == final_plan.intent_id
+        ):
             return True
         return final_words == basis_words
 
@@ -560,8 +703,9 @@ class V2RoutingController(StreamingVoiceController):
         contract = (
             "Runtime output contract: Output spoken text only, without control markers. "
             "The runtime owns call termination. Do not claim a callback was scheduled or an action completed without a verified tool result. "
-            "No scheduling tool is connected. Answer the immediate question first in one short sentence (max 12 words), then ask at most one short question (max 10 words). "
-            "Total response must be under 100 characters. Do not repeat the pitch, invent a company name, or treat uncertainty as consent."
+            "No scheduling tool is connected. Start with the answer immediately. The first phrase must normally be an independently speakable 2-6 word clause ending in a period or comma. "
+            "Avoid introductions such as 'Thank you for sharing', 'I understand', and 'Based on the information'. Use short spoken sentences and ask at most one question. "
+            "Do not repeat information the caller already provided. Total response must be under 100 characters. Do not repeat the pitch, invent a company name, or treat uncertainty as consent."
         )
         documents = self._knowledge_for(text, plan)
         if plan.knowledge_ids:
@@ -632,10 +776,17 @@ class V2RoutingController(StreamingVoiceController):
                 )
             ):
                 state.metrics.spec_tts_started_at = time.perf_counter()
+                state.metrics.spec_tts = "started"
+                state.metrics.spec_tts_reason = "private_synthesis_in_progress"
                 request.spec_audio_text = chunk
                 request.spec_audio_task = asyncio.create_task(
-                    self._prepare_spec_audio(request, chunk),
+                    self._prepare_spec_audio(state, request, chunk),
                     name=f"v2-spec-tts-{state.turn_id}",
+                )
+            elif request.speculative and state.metrics.spec_tts_eligible:
+                state.metrics.spec_tts = (
+                    "waiting_for_eager_eot" if self._flux_mode and not self._flux_eager
+                    else "waiting_for_safe_text"
                 )
             if request.speculative or not self._streaming:
                 return
@@ -705,7 +856,7 @@ class V2RoutingController(StreamingVoiceController):
             raise
         except Exception as exc:
             code = getattr(exc, "code", None)
-            logger.warning("V2 response failed turn={} speculative={} type={} code={}", state.turn_id, request.speculative, type(exc).__name__, code)
+            logger.opt(exception=True).warning("V2 response failed turn={} speculative={} type={} code={} exc={}", state.turn_id, request.speculative, type(exc).__name__, code, exc)
             if not request.speculative and self._state is state:
                 if started:
                     await self.push_frame(LLMFullResponseEndFrame())
@@ -715,7 +866,7 @@ class V2RoutingController(StreamingVoiceController):
             if stream is not None:
                 await stream.close()
 
-    async def _prepare_spec_audio(self, request: LLMRequest, chunk: str) -> None:
+    async def _prepare_spec_audio(self, state, request: LLMRequest, chunk: str) -> None:
         if not self._spec_audio or request.terminal or getattr(request, "spec_audio_invalidated", False):
             return
         prepared = await self._spec_audio.prepare(
@@ -727,6 +878,24 @@ class V2RoutingController(StreamingVoiceController):
             await self._spec_audio.abort(prepared)
             return
         request.spec_audio = prepared
+        if prepared is None:
+            if self._state is state:
+                state.metrics.spec_tts = "miss"
+                state.metrics.spec_tts_reason = "private_socket_unavailable"
+            return
+        ready = getattr(prepared, "ready", None)
+        if ready is not None:
+            await ready.wait()
+        candidate_audio = getattr(prepared, "candidate", None)
+        if (
+            self._state is state and not request.spec_audio_invalidated
+            and (candidate_audio is None or candidate_audio.pcm_chunks)
+        ):
+            first_audio_at = getattr(prepared, "first_audio_at", None)
+            state.metrics.spec_tts_pcm_ready_at = first_audio_at or time.perf_counter()
+            state.metrics.spec_tts_first_audio_at = first_audio_at
+            state.metrics.spec_tts = "pcm_ready"
+            state.metrics.spec_tts_reason = "private_pcm_buffered"
 
     async def _start_existing_spec_audio(self, state, request: LLMRequest) -> None:
         """Upgrade an already-running stable candidate when EagerEOT arrives."""
@@ -740,9 +909,11 @@ class V2RoutingController(StreamingVoiceController):
             return
         chunk = request.answer_chunks[0]
         state.metrics.spec_tts_started_at = time.perf_counter()
+        state.metrics.spec_tts = "started"
+        state.metrics.spec_tts_reason = "private_synthesis_in_progress"
         request.spec_audio_text = chunk
         request.spec_audio_task = asyncio.create_task(
-            self._prepare_spec_audio(request, chunk),
+            self._prepare_spec_audio(state, request, chunk),
             name=f"v2-spec-tts-{state.turn_id}",
         )
 
@@ -760,8 +931,21 @@ class V2RoutingController(StreamingVoiceController):
         updater = self._endpoint_profile_updater
         if not updater or not self.flags.enable_dynamic_endpoints:
             return
-        name = profile_for_prompt(speech)
-        await updater(name)
+        state_name = str(self.session.state.get("name", "OPEN"))
+        states = self.session.agent.flow_graph.get("states") or {}
+        state_config = states.get(state_name, {}) if isinstance(states, dict) else {}
+        name = str(state_config.get("endpoint_profile") or profile_for_prompt(speech))
+        stt_profile = self.session.agent.stt_profile or {}
+        terms = list(stt_profile.get("keyterms") or [])
+        state_terms = stt_profile.get("state_keyterms") or {}
+        terms.extend(state_terms.get(state_name, []) if isinstance(state_terms, dict) else [])
+        roles = self.session.visible_facts().get("roles") or []
+        terms.extend(roles if isinstance(roles, list) else [str(roles)])
+        keyterms = list(dict.fromkeys(str(term) for term in terms if str(term).strip()))
+        await updater(
+            name, keyterms=keyterms,
+            language_hints=stt_profile.get("language_hints") or None,
+        )
         self._endpoint_profile = name
 
     async def _deliver_chunks(self, state, chunks: list[str], speech: str, plan: ResponsePlan) -> None:
@@ -784,7 +968,12 @@ class V2RoutingController(StreamingVoiceController):
             await self.push_frame(EndFrame())
 
     async def _commit_spec_audio(self, request: LLMRequest, fingerprint: str) -> list[bytes] | None:
-        if request.spec_audio is None and request.spec_audio_task and not request.spec_audio_task.done():
+        prepared_candidate = getattr(request.spec_audio, "candidate", None)
+        prepared_has_pcm = bool(
+            request.spec_audio is not None
+            and (prepared_candidate is None or prepared_candidate.pcm_chunks)
+        )
+        if request.spec_audio_task and not request.spec_audio_task.done() and not prepared_has_pcm:
             if self._spec_tts_commit_wait_secs > 0:
                 try:
                     await asyncio.wait_for(
@@ -793,10 +982,19 @@ class V2RoutingController(StreamingVoiceController):
                     )
                 except TimeoutError:
                     pass
-            if request.spec_audio is None:
+            prepared_candidate = getattr(request.spec_audio, "candidate", None)
+            prepared_has_pcm = bool(
+                request.spec_audio is not None
+                and (prepared_candidate is None or prepared_candidate.pcm_chunks)
+            )
+            if not prepared_has_pcm:
                 request.spec_audio_invalidated = True
                 if self._state:
-                    self._state.metrics.spec_tts = "not-ready"
+                    self._state.metrics.spec_tts = "miss"
+                    self._state.metrics.spec_tts_reason = "pcm_not_ready_at_commit"
+                if self._spec_audio and request.spec_audio is not None:
+                    await self._spec_audio.abort(request.spec_audio)
+                self._cancel_task(request.spec_audio_task)
                 return None
         if request.spec_audio is None and request.spec_audio_task and request.spec_audio_task.done():
             try:
@@ -810,7 +1008,12 @@ class V2RoutingController(StreamingVoiceController):
         pcm = await self._spec_audio.commit(request.spec_audio, fingerprint=fingerprint)
         if pcm and self._state:
             self._state.metrics.spec_tts = "hit"
+            self._state.metrics.spec_tts_reason = "fingerprint_validated"
             self._state.metrics.spec_tts_first_audio_at = getattr(request.spec_audio, "first_audio_at", None)
+            self._state.metrics.spec_tts_committed_at = time.perf_counter()
+        elif self._state:
+            self._state.metrics.spec_tts = "miss"
+            self._state.metrics.spec_tts_reason = "fingerprint_or_pcm_mismatch"
         return pcm
 
     async def _abort_spec_audio(self, request: LLMRequest | None) -> None:
@@ -820,8 +1023,9 @@ class V2RoutingController(StreamingVoiceController):
         self._cancel_task(request.spec_audio_task)
         if self._spec_audio and request.spec_audio is not None:
             await self._spec_audio.abort(request.spec_audio)
-            if self._state and self._state.metrics.spec_tts == "none":
+            if self._state and self._state.metrics.spec_tts not in {"hit", "not_eligible"}:
                 self._state.metrics.spec_tts = "cancelled"
+                self._state.metrics.spec_tts_reason = "candidate_invalidated"
 
     async def _promote_speculative_candidate(self, state, request: LLMRequest, pcm: list[bytes], plan: ResponsePlan) -> None:
         """Make a validated soft-EOT candidate public without restarting its LLM.
@@ -901,6 +1105,10 @@ class V2RoutingController(StreamingVoiceController):
         """Commit deterministic state only after the validated response is released."""
         if plan.next_state:
             self.session.state["name"] = plan.next_state
+        if plan.clear_pending_question:
+            self.session.pending_question = None
+        if plan.pending_question is not None:
+            self.session.pending_question = plan.pending_question
         for name, value in plan.slots_written.items():
             schema = self.session.agent.slot_schema.get(name, {})
             validation = self.slot_validator.validate(schema, value)
@@ -915,8 +1123,6 @@ class V2RoutingController(StreamingVoiceController):
             {"role": "assistant", "content": speech},
         ])
         self.session.history = self.session.history[-6:]
-        if self.flags.enable_callback_state_machine:
-            self.callback_coordinator.observe_assistant(speech, self.session.slots)
 
     async def cleanup(self):
         if self._settle_task:

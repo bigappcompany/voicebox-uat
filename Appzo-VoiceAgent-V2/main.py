@@ -119,6 +119,8 @@ class TurnMetrics:
     turn_committed_at: float | None = None
     final_stt_at: float | None = None
     stable_interim_at: float | None = None
+    stable_candidate_started_at: float | None = None
+    stable_candidate_source: str | None = None
     eager_eot_at: float | None = None
     eager_eot_confidence: float | None = None
     eot_confidence: float | None = None
@@ -134,6 +136,9 @@ class TurnMetrics:
     first_safe_text_at: float | None = None
     spec_tts_started_at: float | None = None
     spec_tts_first_audio_at: float | None = None
+    spec_tts_pcm_ready_at: float | None = None
+    spec_tts_committed_at: float | None = None
+    spec_tts_eligible: bool = False
     commit_at: float | None = None
     candidate_validated_at: float | None = None
     candidate_promoted_at: float | None = None
@@ -153,7 +158,14 @@ class TurnMetrics:
     route: str = "pending"
     speculation: str = "none"
     spec_tts: str = "none"
+    spec_tts_reason: str = ""
     endpoint_profile: str = ""
+    semantic_spec_reused: bool = False
+    knowledge_direct_hit: bool = False
+    decision_route: str = "pending"
+    decision_intent: str = "unknown"
+    decision_reason: str = ""
+    hosted_llm_used: bool = False
 
 
 @dataclass
@@ -754,7 +766,7 @@ class LiveLatencyObserver(BaseObserver):
             "RESPONSE LATENCY | "
             f"tenant={getattr(self._session, 'tenant_id', 'legacy')} bundle={getattr(getattr(self._session, 'agent', None), 'version', 'legacy')} "
             f"state={getattr(self._session, 'state', {}).get('name', 'UNKNOWN') if self._session else 'LEGACY'} "
-            f"turn={metrics.turn_id} route={metrics.route} tts={self._tts_transport} speculation={metrics.speculation} spec_tts={metrics.spec_tts} | "
+            f"turn={metrics.turn_id} route={metrics.route} tts={self._tts_transport} speculation={metrics.speculation} spec_tts={metrics.spec_tts} spec_tts_reason={metrics.spec_tts_reason or 'none'} | "
             f"provider-turn={metrics.provider_turn_id} eot-trigger={metrics.eot_trigger} eot-confidence={metrics.eot_confidence} "
             f"provider-EOT->aggregator={self._ms(metrics.provider_eot_at, metrics.aggregator_stop_at)} ms | "
             f"native-EOT->bot-audio={native_eot_to_audio} ms | raw-audio->native-EOT={raw_audio_to_eot} ms | "
@@ -766,6 +778,23 @@ class LiveLatencyObserver(BaseObserver):
             f"EOT->first-safe-text={self._ms(metrics.turn_committed_at, metrics.first_safe_text_at)} ms | "
             f"EOT->first-audible={eot_to_audible} ms | "
             f"input-gaps={metrics.input_gap_count} input-max-gap={metrics.input_gap_max_ms} ms"
+        )
+        coverage = self._optimization_coverage()
+        logger.info(
+            "V2 OPTIMIZATION METRICS | turn={} deterministic_coverage={} hosted_llm_coverage={} "
+            "stable_spec_lead_eager_ms={} stable_spec_lead_hard_eot_ms={} semantic_spec_hit={} "
+            "spec_tts_eligible={} spec_tts_started={} spec_tts_pcm_ready={} spec_tts_committed={} "
+            "knowledge_direct_hit={} first_token_to_first_safe_text_ms={} "
+            "hard_eot_to_first_audible_ms={} raw_speech_end_to_first_audible_ms={}",
+            metrics.turn_id,
+            coverage["deterministic_coverage"], coverage["hosted_llm_coverage"],
+            self._lead_ms(metrics.stable_candidate_started_at, metrics.eager_eot_at),
+            self._lead_ms(metrics.stable_candidate_started_at, metrics.turn_committed_at),
+            coverage["semantic_spec_hit"], coverage["spec_tts_eligible"],
+            coverage["spec_tts_started"], coverage["spec_tts_pcm_ready"],
+            coverage["spec_tts_committed"], coverage["knowledge_direct_hit"],
+            self._ms(metrics.llm_first_token_at, metrics.first_safe_text_at),
+            eot_to_audible, raw_audio_to_bot,
         )
         if breakdown is not None:
             logger.info(
@@ -788,6 +817,13 @@ class LiveLatencyObserver(BaseObserver):
             "tts_transport": self._tts_transport,
             "speculation": metrics.speculation,
             "spec_tts": metrics.spec_tts,
+            "spec_tts_reason": metrics.spec_tts_reason,
+            "decision_route": metrics.decision_route,
+            "decision_intent": metrics.decision_intent,
+            "decision_reason": metrics.decision_reason,
+            "hosted_llm_used": metrics.hosted_llm_used,
+            "knowledge_direct_hit": metrics.knowledge_direct_hit,
+            "semantic_spec_reused": metrics.semantic_spec_reused,
             "flags": asdict(self._runtime_flags),
             "last_voiced_at": metrics.last_voiced_at,
             "provider_eot_at": metrics.provider_eot_at,
@@ -802,6 +838,10 @@ class LiveLatencyObserver(BaseObserver):
             "input_gap_count": metrics.input_gap_count,
             "input_gap_max_ms": metrics.input_gap_max_ms,
             "speculative_started_at": metrics.speculative_started_at,
+            "stable_candidate_started_at": metrics.stable_candidate_started_at,
+            "stable_candidate_source": metrics.stable_candidate_source,
+            "stable_spec_lead_eager_ms": self._lead_ms(metrics.stable_candidate_started_at, metrics.eager_eot_at),
+            "stable_spec_lead_hard_eot_ms": self._lead_ms(metrics.stable_candidate_started_at, metrics.turn_committed_at),
             "llm_request_started_at": metrics.llm_request_started_at,
             "llm_stream_opened_at": metrics.llm_stream_opened_at,
             "llm_first_token_at": metrics.llm_first_token_at,
@@ -809,6 +849,11 @@ class LiveLatencyObserver(BaseObserver):
             "candidate_validated_at": metrics.candidate_validated_at,
             "candidate_promoted_at": metrics.candidate_promoted_at,
             "first_safe_text_at": metrics.first_safe_text_at,
+            "first_token_to_first_safe_text_ms": self._ms(metrics.llm_first_token_at, metrics.first_safe_text_at),
+            "spec_tts_eligible": metrics.spec_tts_eligible,
+            "spec_tts_started_at": metrics.spec_tts_started_at,
+            "spec_tts_pcm_ready_at": metrics.spec_tts_pcm_ready_at,
+            "spec_tts_committed_at": metrics.spec_tts_committed_at,
             "tts_requested_at": metrics.tts_requested_at,
             "tts_first_audio_at": metrics.tts_first_audio_at,
             "tts_first_non_silent_at": metrics.tts_first_non_silent_at,
@@ -820,12 +865,19 @@ class LiveLatencyObserver(BaseObserver):
             "output_silent_packet_count": metrics.output_silent_packet_count,
             "output_audio_ms": metrics.output_audio_ms,
             "first_audible_at": first_audible,
+            "hard_eot_to_first_audible_ms": self._ms(metrics.turn_committed_at, first_audible),
+            "raw_speech_end_to_first_audible_ms": self._ordered_ms(metrics.last_voiced_at, first_audible),
             "first_audible_source": "output_non_silent_pcm" if first_audible is not None else "unavailable",
             "bot_started_at": metrics.bot_started_at,
             "latency_breakdown": breakdown.as_dict() if breakdown is not None else None,
         }
 
     async def cleanup(self):
+        if self._seen_turns:
+            logger.info(
+                "V2 OPTIMIZATION SUMMARY | {}",
+                " ".join(f"{key}={value}" for key, value in self._optimization_coverage().items()),
+            )
         if self._samples:
             ordered = sorted(self._samples)
             percentile = lambda p: ordered[max(0, math.ceil(len(ordered) * p) - 1)]
@@ -842,6 +894,33 @@ class LiveLatencyObserver(BaseObserver):
             )
         await super().cleanup()
 
+    def _optimization_coverage(self) -> dict[str, str]:
+        turns = [
+            metrics for turn_id, metrics in self._controller.metrics_by_turn.items()
+            if turn_id in self._seen_turns
+        ]
+        total = len(turns)
+        speculative = [item for item in turns if item.speculation in {"hit", "hit+tts", "miss"}]
+        eligible = [item for item in turns if item.spec_tts_eligible]
+
+        def percent(count: int, denominator: int) -> str:
+            return f"{(100 * count / denominator):.1f}%({count}/{denominator})" if denominator else "n/a(0/0)"
+
+        deterministic = sum(
+            item.decision_route in {"fixed", "cache", "identity", "faq-direct", "callback-preference", "callback-preference-acknowledged"}
+            for item in turns
+        )
+        return {
+            "deterministic_coverage": percent(deterministic, total),
+            "hosted_llm_coverage": percent(sum(item.hosted_llm_used for item in turns), total),
+            "semantic_spec_hit": percent(sum(item.semantic_spec_reused for item in speculative), len(speculative)),
+            "spec_tts_eligible": percent(len(eligible), total),
+            "spec_tts_started": percent(sum(item.spec_tts_started_at is not None for item in eligible), len(eligible)),
+            "spec_tts_pcm_ready": percent(sum(item.spec_tts_pcm_ready_at is not None for item in eligible), len(eligible)),
+            "spec_tts_committed": percent(sum(item.spec_tts_committed_at is not None for item in eligible), len(eligible)),
+            "knowledge_direct_hit": percent(sum(item.knowledge_direct_hit for item in turns), total),
+        }
+
     def _is_audible(self, audio: bytes) -> bool:
         if len(audio) < 2:
             return False
@@ -853,6 +932,10 @@ class LiveLatencyObserver(BaseObserver):
 
     @staticmethod
     def _ms(start: float | None, end: float | None) -> int | None:
+        return round((end - start) * 1000) if start is not None and end is not None and end >= start else None
+
+    @staticmethod
+    def _lead_ms(start: float | None, end: float | None) -> int | None:
         return round((end - start) * 1000) if start is not None and end is not None and end >= start else None
 
     @staticmethod
@@ -1053,7 +1136,13 @@ async def run_bot(
     @user_aggregator.event_handler("on_user_turn_stopped")
     async def on_user_turn_stopped(_aggregator, _strategy, _message):
         await controller.handle_native_turn_stopped(_message.content)
-    keyterms = v2_session.agent.stt_profile.get("keyterms", []) if controller_options else []
+    keyterms = list(v2_session.agent.stt_profile.get("keyterms", [])) if controller_options else []
+    if controller_options:
+        initial_state = str(v2_session.state.get("name", "OPEN"))
+        state_keyterms = v2_session.agent.stt_profile.get("state_keyterms") or {}
+        if isinstance(state_keyterms, dict):
+            keyterms.extend(state_keyterms.get(initial_state, []) or [])
+        keyterms = list(dict.fromkeys(str(term) for term in keyterms if str(term).strip()))
     if use_flux:
         # `flux-general-multi` accepts language hints rather than the Nova
         # `language=multi` query value.  Goodbox currently serves English and
@@ -1074,16 +1163,22 @@ async def run_bot(
         if controller_options and runtime_flags.enable_dynamic_endpoints:
             from voice_agent.turns.endpoint_profiles import profile_for_prompt
 
-            async def update_flux_endpoint(name: str) -> None:
+            async def update_flux_endpoint(
+                name: str, *, keyterms: list[str] | None = None, language_hints=None
+            ) -> None:
                 profile = flux_profile(name)
-                await stt.configure_endpoint(profile)
+                await stt.configure_endpoint(
+                    profile, keyterms=keyterms, language_hints=language_hints
+                )
                 controller._endpoint_profile = name
                 logger.info(
-                    "V2 FLUX PROFILE | name={} eager={} eot={} timeout_ms={}",
+                    "V2 FLUX PROFILE | state={} name={} eager={} eot={} timeout_ms={} keyterms={}",
+                    getattr(controller, "session", None).state.get("name", "UNKNOWN"),
                     name,
                     profile.eager_eot_threshold,
                     profile.eot_threshold,
                     profile.eot_timeout_ms,
+                    len(keyterms or []),
                 )
 
             controller._endpoint_profile_updater = update_flux_endpoint
