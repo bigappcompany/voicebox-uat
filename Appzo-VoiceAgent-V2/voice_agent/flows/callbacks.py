@@ -64,7 +64,8 @@ class CallbackCoordinator:
             )
 
         callback_context = state in {
-            self.AWAITING_DAY_TIME, self.AWAITING_DAY, self.AWAITING_TIME, self.FOLLOWUP_OFFERED,
+            self.AWAITING_DAY_TIME, self.AWAITING_DAY, self.AWAITING_TIME,
+            self.FOLLOWUP_OFFERED, self.PREFERENCE_RECORDED,
         }
         if not callback_context:
             return None

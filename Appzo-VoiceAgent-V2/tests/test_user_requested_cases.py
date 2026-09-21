@@ -154,6 +154,27 @@ class TestUserRequestedCases(unittest.TestCase):
         self.assertEqual(plan.action, "end_call")
         self.assertIn("Goodbye", speech)
 
+    def test_callback_preference_can_be_corrected_after_recording(self):
+        slots = {
+            "callback_state": self.callbacks.PREFERENCE_RECORDED,
+            "callback_day": "tomorrow",
+            "callback_time": "five pm",
+            "callback_preference": "tomorrow at five pm",
+        }
+        match = self.im.classify("make it Wednesday at five pm", fact_values=slots)
+        plan, speech = self.callbacks.route(match, slots, turn_id=3)
+        self.assertEqual(plan.slots_written["callback_day"], "wednesday")
+        self.assertEqual(plan.slots_written["callback_preference"], "wednesday at five pm")
+        self.assertIn("wednesday", speech.casefold())
+
+    def test_latest_day_wins_inside_correction_utterance(self):
+        pending = PendingQuestion("ask_callback_day_time", "callback_preference", "date_and_time", 1)
+        match = self.im.classify(
+            "tomorrow, actually no, make it Wednesday at five pm",
+            pending_question=pending,
+        )
+        self.assertEqual(match.slots["callback_day"], "wednesday")
+
 
 if __name__ == "__main__":
     unittest.main()

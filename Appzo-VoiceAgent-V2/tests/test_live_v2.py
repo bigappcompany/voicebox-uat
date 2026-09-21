@@ -8,6 +8,7 @@ from live_v2 import V2RoutingController
 from voice_agent.agents.bundle import AgentBundle
 from voice_agent.runtime.session import CallSession
 from voice_agent.runtime.session import PendingQuestion
+from voice_agent.runtime.response_plan import ResponsePlan
 from pipecat.frames.frames import (
     EndFrame,
     LLMFullResponseEndFrame,
@@ -248,6 +249,48 @@ class LiveRoutingTests(unittest.IsolatedAsyncioTestCase):
         state = await self.answer("two pm tomorrow")
         self.assertEqual(state.metrics.route, "v2-hosted")
 
+    async def test_hosted_request_uses_pipecat_context_and_deduplicates_current_turn(self):
+        class Context:
+            def get_messages(self):
+                return [
+                    {"role": "user", "content": "first user"},
+                    {"role": "assistant", "content": "first assistant"},
+                    {"role": "user", "content": "second user"},
+                    {"role": "assistant", "content": "second assistant"},
+                    {"role": "user", "content": "third user"},
+                    {"role": "assistant", "content": "third assistant"},
+                    {"role": "user", "content": "do not end the call"},
+                ]
+
+        self.controller.set_dialogue_context(Context())
+        self.client.chat.completions.create.return_value = FakeStream(["I will continue."])
+        await self.answer("do not end the call")
+        messages = self.client.chat.completions.create.await_args.kwargs["messages"]
+        contents = [message["content"] for message in messages if message["role"] != "system"]
+        self.assertEqual(contents[-1], "do not end the call")
+        self.assertEqual(contents.count("do not end the call"), 1)
+        self.assertEqual(contents[:-1], [
+            "first user", "first assistant", "second user", "second assistant",
+            "third user", "third assistant",
+        ])
+
+    async def test_pending_question_activates_only_after_completed_assistant_turn(self):
+        state = self.controller._state
+        state.final_transcript = "tell me"
+        self.controller.session.pending_question = PendingQuestion(
+            "ask_callback_consent", "followup_consent", "boolean", 0
+        )
+        speech = "We provide apprenticeships. Would you like details?"
+        plan = ResponsePlan("hosted", intent_id="faq_services")
+
+        self.controller._stage_delivery(state, speech, plan)
+        await self.controller.handle_assistant_turn_stopped(content="We provide apprenticeships.", interrupted=True)
+        self.assertIsNone(self.controller.session.pending_question)
+
+        self.controller._stage_delivery(state, speech, plan)
+        await self.controller.handle_assistant_turn_stopped(content=speech, interrupted=False)
+        self.assertEqual(self.controller.session.pending_question.slot, "service_details")
+
     async def test_first_text_released_before_completion(self):
         released = asyncio.Event()
         controller = self.controller
@@ -451,4 +494,3 @@ class LiveRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(state.metrics.route, "v2-error")
         self.assertEqual(state.metrics.route, "v2-hosted")
         self.assertIn("We would be glad to help.", [call.args[0].text for call in self.controller.push_frame.await_args_list if isinstance(call.args[0], LLMTextFrame)])
-

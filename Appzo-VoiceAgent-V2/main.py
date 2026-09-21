@@ -38,6 +38,7 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
+    LLMAssistantAggregatorParams,
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
@@ -166,6 +167,10 @@ class TurnMetrics:
     decision_intent: str = "unknown"
     decision_reason: str = ""
     hosted_llm_used: bool = False
+    pipecat_context_read_ms: float = 0.0
+    context_selection_ms: float = 0.0
+    context_token_estimation_ms: float = 0.0
+    prompt_build_ms: float = 0.0
 
 
 @dataclass
@@ -568,7 +573,10 @@ class StreamingVoiceController(FrameProcessor):
             self._transcript_callback("assistant", text)
         state.metrics.tts_requested_at = time.perf_counter()
         await self._publish_answer_to_conversation(text)
-        await self.push_frame(TTSSpeakFrame(text, append_to_context=False))
+        # The assistant aggregator is the canonical same-call dialogue store.
+        # Preserve fixed/deterministic speech in that context just like hosted
+        # streamed speech; interruption handling decides what was delivered.
+        await self.push_frame(TTSSpeakFrame(text, append_to_context=True))
 
     async def _publish_answer_to_conversation(self, text: str) -> None:
         """Send the complete response to the UI without changing the TTS stream.
@@ -608,15 +616,19 @@ class LiveLatencyObserver(BaseObserver):
         call_origin_at: float | None = None,
     ) -> None:
         super().__init__()
+        # Pipecat 1.7.0 has BaseObserver hooks but no packaged latency
+        # observer/event. Expose the requested event contract on our custom
+        # observer so applications can consume LatencyBreakdown objects.
+        self._register_event_handler("on_latency_breakdown", sync=True)
         self._controller = controller
         self._tts_transport = tts_transport
         self._session = session
         self._call_origin_at = call_origin_at
         self._seen: set[int] = set()
-        self._seen_turns: set[int] = set()
+        self._reported_turn_ids: set[int] = set()
         self._cadence_seen: set[int] = set()
-        self._samples: list[int] = []
-        self._audible_samples: list[int] = []
+        self._samples: dict[str, list[int]] = {}
+        self._audible_samples: dict[str, list[int]] = {}
         self._audible_threshold = int(os.getenv("V2_AUDIBLE_PCM_RMS", "200"))
         self._audio_gap_alert_ms = max(100, int(os.getenv("V2_AUDIO_GAP_ALERT_MS", "350")))
         self._breakdown_min_secs = max(
@@ -675,6 +687,7 @@ class LiveLatencyObserver(BaseObserver):
             and audible
         ):
             metrics.output_first_non_silent_at = now
+            self._schedule_report_if_not_reported(state)
 
     async def on_push_frame(self, data: FramePushed):
         if data.direction != FrameDirection.DOWNSTREAM or data.frame.id in self._seen:
@@ -696,12 +709,17 @@ class LiveLatencyObserver(BaseObserver):
                 metrics.tts_first_non_silent_at = now
         if isinstance(data.frame, BotStartedSpeakingFrame) and metrics.bot_started_at is None:
             metrics.bot_started_at = now
-            asyncio.create_task(self._report_when_audible(state))
+            # This is only a fallback. When PCM metrics are enabled, wait for
+            # actual non-silent output PCM so the report is caller-perceived.
+            if not self._audible_metrics_enabled:
+                self._schedule_report_if_not_reported(state)
         if (
             isinstance(data.frame, (BotStoppedSpeakingFrame, TTSStoppedFrame))
-            and metrics.output_packet_count
             and metrics.turn_id not in self._cadence_seen
         ):
+            # Final safety net: report even if no inspectable output PCM or
+            # BotStartedSpeakingFrame was observed.
+            self._schedule_report_if_not_reported(state)
             self._cadence_seen.add(metrics.turn_id)
             logger.info(
                 "AUDIO CADENCE | turn={} packets={} audio_ms={} max_packet_gap_ms={} long_gaps={} silent_packets={}",
@@ -728,21 +746,13 @@ class LiveLatencyObserver(BaseObserver):
                 ),
             )
 
-    async def _report_when_audible(self, state) -> None:
-        deadline = time.perf_counter() + 0.35
-        while (
-            self._audible_metrics_enabled
-            and state.metrics.output_first_non_silent_at is None
-            and time.perf_counter() < deadline
-        ):
-            await asyncio.sleep(0.01)
-        await self._report_latency(state)
+    def _schedule_report_if_not_reported(self, state) -> None:
+        if state.metrics.turn_id not in self._reported_turn_ids:
+            self._reported_turn_ids.add(state.metrics.turn_id)
+            asyncio.create_task(self._report_latency(state))
 
     async def _report_latency(self, state) -> None:
         metrics = state.metrics
-        if metrics.turn_id in self._seen_turns:
-            return
-        self._seen_turns.add(metrics.turn_id)
         first_audible = (
             metrics.output_first_non_silent_at
             if self._audible_metrics_enabled
@@ -758,11 +768,11 @@ class LiveLatencyObserver(BaseObserver):
         raw_audio_to_eot = self._ordered_ms(metrics.last_voiced_at, metrics.turn_committed_at)
         raw_audio_to_bot = self._ordered_ms(metrics.last_voiced_at, first_audible)
         if native_eot_to_audio is not None and metrics.route not in {"v2-error", "stt-empty-retry"}:
-            self._samples.append(native_eot_to_audio)
+            self._samples.setdefault(metrics.route, []).append(native_eot_to_audio)
         eot_to_audible = self._ms(metrics.turn_committed_at, first_audible)
         if eot_to_audible is not None and metrics.route not in {"v2-error", "stt-empty-retry"}:
-            self._audible_samples.append(eot_to_audible)
-        logger.info(
+            self._audible_samples.setdefault(metrics.route, []).append(eot_to_audible)
+        report_lines = [
             "RESPONSE LATENCY | "
             f"tenant={getattr(self._session, 'tenant_id', 'legacy')} bundle={getattr(getattr(self._session, 'agent', None), 'version', 'legacy')} "
             f"state={getattr(self._session, 'state', {}).get('name', 'UNKNOWN') if self._session else 'LEGACY'} "
@@ -778,7 +788,8 @@ class LiveLatencyObserver(BaseObserver):
             f"EOT->first-safe-text={self._ms(metrics.turn_committed_at, metrics.first_safe_text_at)} ms | "
             f"EOT->first-audible={eot_to_audible} ms | "
             f"input-gaps={metrics.input_gap_count} input-max-gap={metrics.input_gap_max_ms} ms"
-        )
+        ]
+        logger.info("\n".join(report_lines))
         coverage = self._optimization_coverage()
         logger.info(
             "V2 OPTIMIZATION METRICS | turn={} deterministic_coverage={} hosted_llm_coverage={} "
@@ -797,11 +808,13 @@ class LiveLatencyObserver(BaseObserver):
             eot_to_audible, raw_audio_to_bot,
         )
         if breakdown is not None:
-            logger.info(
-                "LATENCY BREAKDOWN | turn={} route={}\n{}",
-                metrics.turn_id,
-                metrics.route,
-                "\n".join(breakdown.turn_contribution_lines(self._breakdown_min_secs)),
+            await self._call_event_handler("on_latency_breakdown", breakdown)
+        else:
+            logger.warning(
+                "LATENCY BREAKDOWN UNAVAILABLE | turn={} route={} "
+                "hard_eot={} output_first_non_silent={} bot_started={}",
+                metrics.turn_id, metrics.route, metrics.turn_committed_at,
+                metrics.output_first_non_silent_at, metrics.bot_started_at,
             )
         logger.info("LATENCY RECORD | {}", json.dumps(self._record(metrics, breakdown, first_audible), sort_keys=True))
 
@@ -869,35 +882,46 @@ class LiveLatencyObserver(BaseObserver):
             "raw_speech_end_to_first_audible_ms": self._ordered_ms(metrics.last_voiced_at, first_audible),
             "first_audible_source": "output_non_silent_pcm" if first_audible is not None else "unavailable",
             "bot_started_at": metrics.bot_started_at,
+            "raw_speech_end_to_eager_eot_ms": self._ordered_ms(metrics.last_voiced_at, metrics.eager_eot_at),
+            "eager_eot_to_hard_eot_ms": self._ordered_ms(metrics.eager_eot_at, metrics.turn_committed_at),
+            "raw_speech_end_to_hard_eot_ms": self._ordered_ms(metrics.last_voiced_at, metrics.turn_committed_at),
+            "spec_start_to_first_safe_ms": self._ms(metrics.speculative_started_at, metrics.first_safe_text_at),
+            "spec_start_to_pcm_ready_ms": self._ms(metrics.spec_tts_started_at, metrics.spec_tts_pcm_ready_at),
+            "spec_tts_savings_ms": self._ordered_ms(metrics.spec_tts_pcm_ready_at, metrics.turn_committed_at),
+            "pipecat_context_read_ms": metrics.pipecat_context_read_ms,
+            "context_selection_ms": metrics.context_selection_ms,
+            "context_token_estimation_ms": metrics.context_token_estimation_ms,
+            "prompt_build_ms": metrics.prompt_build_ms,
             "latency_breakdown": breakdown.as_dict() if breakdown is not None else None,
         }
 
     async def cleanup(self):
-        if self._seen_turns:
+        if self._reported_turn_ids:
             logger.info(
                 "V2 OPTIMIZATION SUMMARY | {}",
                 " ".join(f"{key}={value}" for key, value in self._optimization_coverage().items()),
             )
-        if self._samples:
-            ordered = sorted(self._samples)
+        for route, samples in sorted(self._samples.items()):
+            ordered = sorted(samples)
             percentile = lambda p: ordered[max(0, math.ceil(len(ordered) * p) - 1)]
             logger.info(
-                f"NATIVE-EOT->BOT-AUDIO SUMMARY | tts={self._tts_transport} n={len(ordered)} p50={percentile(.50)} ms "
+                f"NATIVE-EOT->BOT-AUDIO SUMMARY | route={route} tts={self._tts_transport} n={len(ordered)} p50={percentile(.50)} ms "
                 f"p90={percentile(.90)} ms p95={percentile(.95)} ms max={ordered[-1]} ms"
             )
-        if self._audible_samples:
-            ordered = sorted(self._audible_samples)
+        for route, samples in sorted(self._audible_samples.items()):
+            ordered = sorted(samples)
             percentile = lambda p: ordered[max(0, math.ceil(len(ordered) * p) - 1)]
             logger.info(
-                f"EOT->FIRST-AUDIBLE SUMMARY | tts={self._tts_transport} n={len(ordered)} p50={percentile(.50)} ms "
+                f"EOT->FIRST-AUDIBLE SUMMARY | route={route} tts={self._tts_transport} n={len(ordered)} p50={percentile(.50)} ms "
                 f"p90={percentile(.90)} ms p95={percentile(.95)} ms p99={percentile(.99)} ms max={ordered[-1]} ms"
             )
         await super().cleanup()
 
     def _optimization_coverage(self) -> dict[str, str]:
+        metrics_by_turn = getattr(self._controller, "metrics_by_turn", {})
         turns = [
-            metrics for turn_id, metrics in self._controller.metrics_by_turn.items()
-            if turn_id in self._seen_turns
+            metrics for turn_id, metrics in metrics_by_turn.items()
+            if turn_id in self._reported_turn_ids
         ]
         total = len(turns)
         speculative = [item for item in turns if item.speculation in {"hit", "hit+tts", "miss"}]
@@ -1011,13 +1035,17 @@ async def run_bot(
             intro_text=runtime.intro_message,
         )
         cached_greeting = greeting_cache.get(greeting_key)
+    endpoint_profile_preset = os.getenv("V2_ENDPOINT_PROFILE_PRESET", "current").lower()
+    tts_buffer_ms = int(os.getenv("CARTESIA_MAX_BUFFER_DELAY_MS", os.getenv("V2_TTS_BUFFER_DELAY_MS", "150")))
     logger.info(
-        "TURN config model={} stt={} endpointing_ms={} vad_stop_secs={} strategy={}",
+        "TURN config model={} stt={} endpointing_ms={} vad_stop_secs={} strategy={} flux_preset={} tts_buffer_ms={}",
         runtime.llm_model,
         runtime.stt_model,
         runtime.deepgram_endpointing_ms,
         runtime.vad_stop_secs,
         f"Flux/ExternalTurn/{endpoint_profile_name}" if use_flux else "SmartTurn",
+        endpoint_profile_preset,
+        tts_buffer_ms,
     )
     rtvi_processor = RTVIProcessor()
 
@@ -1099,6 +1127,19 @@ async def run_bot(
         session=v2_session if controller_options else None,
         call_origin_at=telephony_connected_at,
     )
+
+    @latency_observer.event_handler("on_latency_breakdown")
+    async def on_latency_breakdown(_observer, breakdown):
+        logger.info(
+            "── LATENCY BREAKDOWN | turn={} ──\n{}",
+            breakdown.turn_id,
+            "\n".join(
+                f"  {line}"
+                for line in breakdown.turn_contribution_lines(
+                    latency_observer._breakdown_min_secs
+                )
+            ),
+        )
     context = LLMContext()
     # Flux owns start, resume and hard-EOT detection.  Giving the aggregator
     # external strategies is essential: pairing Flux with Silero/SmartTurn
@@ -1122,7 +1163,12 @@ async def run_bot(
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=user_params,
+        assistant_params=LLMAssistantAggregatorParams(
+            enable_auto_context_summarization=False,
+        ),
     )
+    if controller_options:
+        controller.set_dialogue_context(context)
 
     @user_aggregator.event_handler("on_user_turn_started")
     async def on_user_turn_started(_aggregator, strategy):
@@ -1136,6 +1182,16 @@ async def run_bot(
     @user_aggregator.event_handler("on_user_turn_stopped")
     async def on_user_turn_stopped(_aggregator, _strategy, _message):
         await controller.handle_native_turn_stopped(_message.content)
+
+    @assistant_aggregator.event_handler("on_assistant_turn_stopped")
+    async def on_assistant_turn_stopped(_aggregator, message):
+        if controller_options:
+            await controller.handle_assistant_turn_stopped(
+                content=message.content or "",
+                interrupted=bool(message.interrupted),
+            )
+            if controller._state:
+                latency_observer._schedule_report_if_not_reported(controller._state)
     keyterms = list(v2_session.agent.stt_profile.get("keyterms", [])) if controller_options else []
     if controller_options:
         initial_state = str(v2_session.state.get("name", "OPEN"))
@@ -1239,7 +1295,7 @@ async def run_bot(
             # successive phrase chunks when the LLM streams tokens slowly, avoiding
             # the elongated-word / dropout artefact on slow-LLM turns.
             text_aggregation_mode=(TextAggregationMode.TOKEN if controller_options else TextAggregationMode.SENTENCE),
-            max_buffer_delay_ms=int(os.getenv("V2_TTS_BUFFER_DELAY_MS", "150")) if controller_options else None,
+            max_buffer_delay_ms=int(os.getenv("CARTESIA_MAX_BUFFER_DELAY_MS", os.getenv("V2_TTS_BUFFER_DELAY_MS", "150"))) if controller_options else None,
         )
     pipeline_processors = [transport.input(), stt, controller, user_aggregator, tts]
     if controller_options and os.getenv("ENABLE_TTS_LEADING_SILENCE_TRIM", "true").lower() == "true":
@@ -1249,7 +1305,10 @@ async def run_bot(
         from voice_agent.speech.greeting_cache import GreetingCaptureProcessor
         greeting_capture = GreetingCaptureProcessor(greeting_cache, greeting_key)
         pipeline_processors.append(greeting_capture)
-    pipeline_processors.extend([assistant_aggregator, transport.output()])
+    # Pipecat dialogue memory must observe the assistant text after the output
+    # path. This keeps committed context aligned with what was actually sent
+    # and lets interruption events reconcile V2's semantic pending question.
+    pipeline_processors.extend([transport.output(), assistant_aggregator])
     pipeline = Pipeline(pipeline_processors)
     runner = WorkerRunner(
         handle_sigint=runner_args.handle_sigint if runner_args else False

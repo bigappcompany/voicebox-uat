@@ -12,7 +12,7 @@ from ..runtime.response_plan import ResponsePlan
 class PromptBuilder:
     """Build the bounded runtime request from the immutable Goodbox bundle."""
 
-    def __init__(self, max_history_turns: int = 1, max_knowledge_chars: int = 1200, *, compiled: bool = True) -> None:
+    def __init__(self, max_history_turns: int = 3, max_knowledge_chars: int = 1200, *, compiled: bool = True) -> None:
         self.max_history_turns = max_history_turns
         self.max_knowledge_chars = max_knowledge_chars
         self.max_invariant_chars = int(os.getenv("V2_MAX_INVARIANT_CHARS", "6000"))
@@ -75,10 +75,19 @@ class PromptBuilder:
             f"OBJECTIVE: {objective}",
             f"ALLOWED ACTIONS: {action_names}",
             f"KNOWN FACTS: {known}",
+            "MEMORY CONTRACT: KNOWN FACTS are authoritative business truth. Use recent dialogue for tone, references, and ambiguity.",
+            "Do not contradict a known fact unless the current caller explicitly corrects it.",
             "Do not ask for a fact that is already present in KNOWN FACTS unless the caller is correcting it.",
         )).strip()
         docs = "\n".join(getattr(doc, "text", str(doc)) for doc in knowledge)[:self.max_knowledge_chars]
-        history_slice = history[-self.max_history_turns * 2:]
+        history_slice = list(history[-self.max_history_turns * 2:])
+        if (
+            history_slice
+            and history_slice[-1].get("role") == "user"
+            and " ".join(str(history_slice[-1].get("content", "")).casefold().split())
+            == " ".join(user_text.casefold().split())
+        ):
+            history_slice.pop()
         self.section_token_estimates = {
             "invariant": self._estimate(invariant),
             "state": self._estimate(system) - self._estimate(invariant),

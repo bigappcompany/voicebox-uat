@@ -28,13 +28,18 @@ class BookingClaimGuard:
         # calls: "I have noted the meeting", "I can arrange a connect", and
         # "I will connect with you tomorrow". No scheduling tool exists in
         # this runtime, so none of these claims may reach TTS.
+        # Deterministic callback copy already states the required limitation;
+        # do not rewrite it merely because it says that a preference was
+        # recorded. This keeps the explicit "not a confirmed booking" wording.
+        if re.search(r"\bnot a confirmed booking\b|\bconfirm availability\b", sentence, re.I):
+            return sentence
         claim = re.search(
             r"\b(?:scheduled|booked|confirmed|reserved)\b|"
             r"\b(?:i\s+)?(?:will|can|shall|am going to|['’]ll)\s+"
             r"(?:call|reach out|contact|connect|arrange|schedule|book)\b|"
             r"\b(?:i\s+)?(?:have|['’]ve)\s+(?:arranged|scheduled|booked|confirmed)\b|"
             r"\b(?:noted|recorded)\s+(?:the\s+)?(?:meeting|appointment|call|callback)\b|"
-            r"\barrange(?:d|ment)?\s+(?:a\s+)?(?:meeting|appointment|call|callback|connect)\b",
+            r"\barrange(?:d|ment)?\s+(?:a|the\s+)?(?:meeting|appointment|call|callback|connect|follow-?up)\b",
             sentence,
             re.I,
         )

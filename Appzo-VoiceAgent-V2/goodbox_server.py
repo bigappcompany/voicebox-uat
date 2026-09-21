@@ -8,8 +8,11 @@ webhook that Goodbox's Plivo number reaches after a call is placed.
 import base64
 import hashlib
 import os
+import sys
 import time
+import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode, urlparse, urlunparse
 from xml.sax.saxutils import escape
@@ -23,6 +26,7 @@ from main import AgentRuntimeConfig, run_bot
 from voice_agent.agents.compiler import AgentCompiler
 from voice_agent.agents.registry import AgentBundleRegistry
 from voice_agent.runtime.bootstrap import RuntimeBootstrap
+from voice_agent.runtime.flags import RuntimeFlags
 from pipecat.runner.utils import parse_telephony_websocket
 from pipecat.serializers.plivo import PlivoFrameSerializer
 from pipecat.transports.websocket.fastapi import (
@@ -35,6 +39,31 @@ CALL_START_PATH = "/voice-calls/call-start"
 CALL_STOP_PATH = "/voice-calls/call-stop"
 _LLM_CLIENTS: dict[tuple[str, str, str], object] = {}
 
+
+def setup_logging() -> Path:
+    """Configure shared Loguru sinks once for the serving process."""
+    log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+    log_path = Path(os.getenv("VOICEAGENT_RUNTIME_LOG", "").strip() or (
+        Path(__file__).resolve().parent / "logs" / "voiceagent.log"
+    )).expanduser().resolve()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    logger.remove()
+    logger.add(
+        sys.stderr,
+        level=log_level,
+        enqueue=True,
+        format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <level>{message}</level>",
+    )
+    logger.add(
+        str(log_path),
+        level="DEBUG",
+        rotation="50 MB",
+        enqueue=True,
+        backtrace=False,
+        diagnose=False,
+        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {message}",
+    )
+    return log_path
 
 def _required(name: str) -> str:
     value = os.getenv(name, "").strip()
@@ -252,14 +281,32 @@ v2_bootstrap = RuntimeBootstrap(AgentBundleRegistry(), AgentCompiler())
 
 @app.on_event("startup")
 async def startup() -> None:
+    log_path = setup_logging()
     _required("GOODBOX_API_BASE_URL")
-    _required("PUBLIC_BASE_URL")
+    public_base_url = _required("PUBLIC_BASE_URL")
+    app.state.instance_id = uuid.uuid4().hex[:12]
+    app.state.started_at = time.time()
+    app.state.callback_count = 0
+    app.state.media_count = 0
     logger.info("Goodbox Plivo voice server ready")
+    logger.info("Server instance ID: {}", app.state.instance_id)
+    logger.info("Public health URL: {}/health", public_base_url)
+    logger.info("Runtime log file: {}", log_path)
+    logger.info("Latency observer enabled: true")
+    logger.info("Audible PCM metrics enabled: {}", RuntimeFlags.from_env().enable_audible_pcm_metrics)
 
 
 @app.get("/health")
-async def health() -> dict[str, bool]:
-    return {"ok": True}
+async def health() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "instance_id": getattr(app.state, "instance_id", None),
+        "started_at": getattr(app.state, "started_at", None),
+        "latency_observer_enabled": True,
+        "audible_pcm_metrics_enabled": RuntimeFlags.from_env().enable_audible_pcm_metrics,
+        "plivo_callback_count": getattr(app.state, "callback_count", 0),
+        "plivo_media_count": getattr(app.state, "media_count", 0),
+    }
 
 
 @app.post("/v1/plivo/callback/{phone_id}")
@@ -269,6 +316,8 @@ async def plivo_callback(
     From: str | None = Form(None),
     To: str | None = Form(None),
 ) -> Response:
+    app.state.callback_count = getattr(app.state, "callback_count", 0) + 1
+    logger.info("PLIVO CALLBACK | call_id={} phone_id={}", CallUUID, phone_id)
     public_base_url = _required("PUBLIC_BASE_URL")
     body = {
         "phone_id": phone_id,
@@ -289,6 +338,8 @@ async def plivo_callback(
 async def plivo_media(websocket: WebSocket, body: str = Query("")) -> None:
     #logger.log("Received plivo ws connection")
     await websocket.accept()
+    app.state.media_count = getattr(app.state, "media_count", 0) + 1
+    logger.info("PLIVO MEDIA | websocket accepted")
     telephony_connected_at = time.perf_counter()
     try:
         import json

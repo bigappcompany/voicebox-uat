@@ -6,6 +6,7 @@ from voice_agent.agents.compiler import AgentCompiler
 from voice_agent.agents.registry import AgentBundleRegistry
 from voice_agent.knowledge.index import KnowledgeRecord, TenantKnowledgeIndex
 from voice_agent.llm.prompt_builder import PromptBuilder
+from voice_agent.llm.context_adapter import ConversationContextAdapter
 from voice_agent.runtime.latency_controller import LatencyController
 from voice_agent.runtime.response_plan import ResponsePlan
 from voice_agent.runtime.session import CallSession
@@ -130,6 +131,39 @@ class V2RuntimeTests(unittest.TestCase):
         self.assertIn('"headcount":"about 3-4 people"', messages[0]["content"])
         self.assertIn('"hiring_timeline":"3-4 months"', messages[0]["content"])
         self.assertIn('"roles":["operations"]', messages[0]["content"])
+
+    def test_context_adapter_selects_three_pairs_and_deduplicates_current_user(self):
+        class Context:
+            def get_messages(self):
+                messages = []
+                for index in range(1, 5):
+                    messages.extend([
+                        {"role": "user", "content": f"user {index}"},
+                        {"role": "assistant", "content": f"assistant {index}"},
+                    ])
+                messages.append({"role": "user", "content": "current request"})
+                return messages
+
+        session = CallSession("call", "tenant-a", bundle())
+        hosted = ConversationContextAdapter(Context(), session).build_hosted_context(
+            current_user_text="current request", max_turns=3, max_tokens=500,
+        )
+        self.assertEqual(len(hosted.recent_dialogue), 6)
+        self.assertEqual(hosted.recent_dialogue[0]["content"], "user 2")
+        self.assertNotIn("current request", [item["content"] for item in hosted.recent_dialogue])
+
+    def test_prompt_builder_does_not_duplicate_current_user_from_history(self):
+        messages = PromptBuilder(max_history_turns=3).build(
+            agent=bundle(), state={"name": "OPEN"}, slots={},
+            route=ResponsePlan("hosted"), knowledge=[],
+            history=[{"role": "assistant", "content": "How can I help?"},
+                     {"role": "user", "content": "Current request"}],
+            user_text="current request",
+        )
+        self.assertEqual(
+            sum(item["role"] == "user" and item["content"].casefold() == "current request" for item in messages),
+            1,
+        )
 
 
     def test_slot_validator_enforces_compiled_type_bounds_and_enums(self):

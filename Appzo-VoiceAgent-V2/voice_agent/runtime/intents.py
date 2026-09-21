@@ -55,6 +55,16 @@ class CanonicalIntentModel:
         r"(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve))\b"
     )
 
+    def _parse_boolean(self, value: str) -> str:
+        # A more robust boolean parser for phrases like "that is true yeah"
+        # or negations like "yeah no dont do that"
+        val = value.casefold()
+        if re.search(r"\b(?:no|nope|not|dont|do not)\b", val):
+            return "no"
+        if re.search(r"\b(?:yes|yep|yup|yeah|sure|okay|ok|correct|true|go ahead|fine)\b", val):
+            return "yes"
+        return "ambiguous"
+
     def classify(
         self,
         text: str,
@@ -108,33 +118,40 @@ class CanonicalIntentModel:
         if re.search(r"\b(?:what (?:kind of|type of)?\s*(?:preference|callback|option)|clarify|what do you mean)\b", value):
             return IntentMatch("clarification", .95, "clarification_phrase")
 
-        day = self._days.search(value)
-        clock = self._times.search(value)
+        day_matches = list(self._days.finditer(value))
+        clock_matches = list(self._times.finditer(value))
+        # Corrections commonly contain both the abandoned and replacement
+        # value: "tomorrow—actually Wednesday at five pm". The latest entity
+        # is authoritative for the current turn.
+        day = day_matches[-1] if day_matches else None
+        clock = clock_matches[-1] if clock_matches else None
         if pending_slot in {"callback_day", "callback_time", "callback_preference"} or pending_intent.startswith("ask_callback"):
             if day and clock:
-                return IntentMatch("callback_day_time", .99, "pending_question", {"callback_day": day.group(1), "callback_time": clock.group(1)})
+                return IntentMatch("callback_day_time", .99, "pending_question", {"callback_day": day.group(1).strip(), "callback_time": clock.group(1).strip()})
             if day:
-                return IntentMatch("callback_day", .99, "pending_question", {"callback_day": day.group(1)})
+                return IntentMatch("callback_day", .99, "pending_question", {"callback_day": day.group(1).strip()})
             if clock:
-                return IntentMatch("callback_time", .99, "pending_question", {"callback_time": clock.group(1)})
+                return IntentMatch("callback_time", .99, "pending_question", {"callback_time": clock.group(1).strip()})
         else:
             if day and clock:
-                return IntentMatch("callback_day_time", .95, "day_time_phrase", {"callback_day": day.group(1), "callback_time": clock.group(1)})
+                return IntentMatch("callback_day_time", .95, "day_time_phrase", {"callback_day": day.group(1).strip(), "callback_time": clock.group(1).strip()})
             if day:
-                return IntentMatch("callback_day", .95, "day_phrase", {"callback_day": day.group(1)})
+                return IntentMatch("callback_day", .95, "day_phrase", {"callback_day": day.group(1).strip()})
             if clock:
-                return IntentMatch("callback_time", .95, "time_phrase", {"callback_time": clock.group(1)})
+                return IntentMatch("callback_time", .95, "time_phrase", {"callback_time": clock.group(1).strip()})
 
+        bool_val = self._parse_boolean(value)
         if pending_intent in {"offer_callback", "ask_callback_consent"} or pending_slot in {"followup_consent", "callback_consent"}:
-            if value in self._yes:
+            if bool_val == "yes":
                 return IntentMatch("callback_consent_yes", .995, "pending_question")
-            if value in self._no:
+            if bool_val == "no":
                 return IntentMatch("callback_consent_no", .995, "pending_question")
 
-        if pending_slot == "hiring_status" and value in self._yes:
-            return IntentMatch("provide_hiring_status", .995, "pending_question", {"hiring_status": "yes"})
-        if pending_slot == "hiring_status" and value in self._no:
-            return IntentMatch("provide_hiring_status", .995, "pending_question", {"hiring_status": "no"})
+        if pending_slot == "hiring_status":
+            if bool_val == "yes":
+                return IntentMatch("provide_hiring_status", .995, "pending_question", {"hiring_status": "yes"})
+            if bool_val == "no":
+                return IntentMatch("provide_hiring_status", .995, "pending_question", {"hiring_status": "no"})
         if pending_slot == "headcount":
             if current_facts.get("headcount") is not None:
                 return IntentMatch("provide_headcount", .99, "pending_question")

@@ -13,6 +13,16 @@ class PendingQuestion:
 
 
 @dataclass
+class AssistantDeliveryState:
+    response_id: str
+    plan_intent: str | None
+    generated_text: str = ""
+    spoken_text: str = ""
+    interrupted: bool = False
+    question_id: str | None = None
+
+
+@dataclass
 class CallSession:
     call_id: str
     tenant_id: str
@@ -21,6 +31,7 @@ class CallSession:
     slots: dict[str, object] = field(default_factory=dict)
     facts: dict[str, Any] = field(default_factory=dict)
     pending_question: PendingQuestion | None = None
+    assistant_delivery: AssistantDeliveryState | None = None
     history: list[dict[str, str]] = field(default_factory=list)
     # Built only at call setup. The V2 media path never fetches Goodbox or a
     # remote vector store after caller EOT.

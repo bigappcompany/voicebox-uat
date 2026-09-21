@@ -27,6 +27,8 @@ class FluxEndpointProfile:
     eot_timeout_ms: int
 
 
+import os
+
 FLUX_PROFILES = {
     "balanced": FluxEndpointProfile(.55, .70, 3000),
     # The default sales-call profile favours responsiveness while retaining a
@@ -44,9 +46,20 @@ FLUX_PROFILES = {
     "freeform": FluxEndpointProfile(.35, .55, 1400),
 }
 
+LATENCY_TEST_FLUX_PROFILES = {
+    "balanced": FluxEndpointProfile(.55, .70, 3000),
+    "fast": FluxEndpointProfile(.35, .55, 1200),
+    "yes_no": FluxEndpointProfile(.30, .50, 400),
+    "short_entity": FluxEndpointProfile(.30, .52, 550),
+    "requirements": FluxEndpointProfile(.30, .50, 750),
+    "freeform": FluxEndpointProfile(.35, .55, 1100),
+}
+
 
 def flux_profile(name: str) -> FluxEndpointProfile:
-    return FLUX_PROFILES.get(name.casefold(), FLUX_PROFILES["fast"])
+    preset = os.getenv("V2_ENDPOINT_PROFILE_PRESET", "current").lower()
+    profiles = LATENCY_TEST_FLUX_PROFILES if preset == "latency_test" else FLUX_PROFILES
+    return profiles.get(name.casefold(), profiles["fast"])
 
 
 def profile_for_prompt(text: str) -> str:

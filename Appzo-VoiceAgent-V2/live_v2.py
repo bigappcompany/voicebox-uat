@@ -9,6 +9,7 @@ import asyncio
 import os
 import re
 import time
+import uuid
 from dataclasses import replace
 
 from loguru import logger
@@ -27,6 +28,7 @@ from voice_agent.turns.flux import FluxResumeFrame
 
 from main import LLMRequest, StreamingVoiceController, normalize
 from voice_agent.llm.prompt_builder import PromptBuilder
+from voice_agent.llm.context_adapter import ConversationContextAdapter
 from voice_agent.flows.engine import FlowEngine
 from voice_agent.flows.slots import SlotValidator
 from voice_agent.flows.facts import FactExtractor
@@ -36,7 +38,7 @@ from voice_agent.runtime.fingerprints import ResponseFingerprint
 from voice_agent.runtime.flags import RuntimeFlags
 from voice_agent.runtime.intents import CanonicalIntentModel
 from voice_agent.runtime.response_plan import ResponsePlan
-from voice_agent.runtime.session import PendingQuestion
+from voice_agent.runtime.session import AssistantDeliveryState, PendingQuestion
 from voice_agent.speech.safe_chunker import SafeSpeechChunker
 from voice_agent.speech.speculative_cartesia import SpeculativeCartesiaBuffer
 from voice_agent.speech.stream_filter import SpeechStreamFilter
@@ -71,7 +73,22 @@ class V2RoutingController(StreamingVoiceController):
         profile_name = str(session.agent.fact_profile.get("name") or os.getenv("V2_FACT_PROFILE", "recruitment"))
         self.fact_extractor = FactExtractor(session.agent.fact_profile, default_profile=profile_name)
         self.callback_coordinator = CallbackCoordinator()
-        self.prompt_builder = PromptBuilder(compiled=self.flags.enable_compiled_prompts)
+        self._context_turns = int(os.getenv("V2_PIPECAT_CONTEXT_TURNS", "3"))
+        self._context_max_tokens = int(os.getenv("V2_PIPECAT_CONTEXT_MAX_TOKENS", "500"))
+        self.prompt_builder = PromptBuilder(
+            max_history_turns=self._context_turns,
+            compiled=self.flags.enable_compiled_prompts,
+        )
+        self._context_adapter: ConversationContextAdapter | None = None
+        self._use_pipecat_context = os.getenv(
+            "V2_USE_PIPECAT_DIALOGUE_CONTEXT", "true"
+        ).lower() == "true"
+        self._compare_context = os.getenv("V2_ENABLE_CONTEXT_COMPARE", "false").lower() == "true"
+        self._log_llm_payloads = os.getenv("V2_LOG_LLM_PAYLOADS", "false").lower() == "true"
+        self._request_attempts: dict[int, int] = {}
+        self._planned_pending_question: PendingQuestion | None = None
+        self._delivery_state = None
+        self._delivery_speech = ""
         self._pending_text = ""
         self._latest_finalized_text = ""
         self._settle_task: asyncio.Task | None = None
@@ -142,6 +159,65 @@ class V2RoutingController(StreamingVoiceController):
             self._safe_chunk_profile, self._safe_chunk_chars,
             self._safe_chunk_words, self._safe_chunk_max_wait_ms,
         )
+
+    def set_dialogue_context(self, context) -> None:
+        """Attach the call's Pipecat-owned semantic dialogue store."""
+        self._context_adapter = ConversationContextAdapter(context, self.session)
+
+    def _hosted_history(self, text: str) -> tuple[list[dict[str, str]], dict[str, int]]:
+        if not self._use_pipecat_context or self._context_adapter is None:
+            history = list(self.session.history[-self._context_turns * 2:])
+            return history, {
+                "total": len(self.session.history),
+                "selected": len(history),
+                "tokens": sum((len(item.get("content", "")) + 3) // 4 for item in history),
+                "version": len(self.session.history),
+            }
+        started = time.perf_counter()
+        hosted = self._context_adapter.build_hosted_context(
+            current_user_text=text,
+            max_turns=self._context_turns,
+            max_tokens=self._context_max_tokens,
+        )
+        history = [dict(item) for item in hosted.recent_dialogue]
+        metrics = {
+            "total": hosted.dialogue_version,
+            "selected": len(history),
+            "tokens": hosted.estimated_tokens,
+            "version": hosted.dialogue_version,
+            "bridge_us": round((time.perf_counter() - started) * 1_000_000),
+            "pipecat_context_read_ms": hosted.pipecat_read_ms,
+            "context_selection_ms": hosted.selection_ms,
+            "context_token_estimation_ms": hosted.token_estimation_ms,
+        }
+        if self._compare_context:
+            shadow = self.session.history[-self._context_turns * 2:]
+            logger.debug(
+                "V2 CONTEXT COMPARE | pipecat_messages={} session_history_messages={} semantic_match={}",
+                len(history), len(shadow), history == shadow,
+            )
+        return history, metrics
+
+    def _prepare_request(self, state, request: LLMRequest, text: str, *, slots_before: dict) -> None:
+        attempt = self._request_attempts.get(state.turn_id, 0) + 1
+        self._request_attempts[state.turn_id] = attempt
+        history, context_metrics = self._hosted_history(text)
+        request.v2_request_id = uuid.uuid4().hex
+        request.v2_attempt = attempt
+        request.v2_history = history
+        request.v2_context_metrics = context_metrics
+        request.v2_slots_before = dict(slots_before)
+
+    @staticmethod
+    def _pending_payload(pending) -> dict | None:
+        if pending is None:
+            return None
+        return {
+            "intent": pending.intent,
+            "slot": pending.slot,
+            "expected_type": pending.expected_type,
+            "asked_turn": pending.asked_turn,
+        }
 
     async def process_frame(self, frame, direction):
         if direction == FrameDirection.DOWNSTREAM and self._flux_mode:
@@ -295,6 +371,9 @@ class V2RoutingController(StreamingVoiceController):
         candidate.v2_slots = provisional_slots
         candidate.v2_source = source
         candidate.v2_fingerprint = fingerprint
+        self._prepare_request(
+            state, candidate, basis, slots_before=self.session.visible_facts()
+        )
         state.candidate = candidate
         state.speculation_restarts += 1
         state.metrics.speculative_started_at = time.perf_counter()
@@ -437,6 +516,7 @@ class V2RoutingController(StreamingVoiceController):
             state.metrics.turn_committed_at = self._native_stop_at
         self.session.turn_id = state.turn_id
         text = state.final_transcript
+        state.v2_slots_before = dict(self.session.visible_facts())
         if self.flags.enable_structured_facts:
             facts = self.fact_extractor.extract(
                 text, self.session.visible_facts(),
@@ -494,6 +574,7 @@ class V2RoutingController(StreamingVoiceController):
                 state.metrics.speculation = "hit"
                 state.metrics.semantic_spec_reused = normalize(candidate.transcript) != normalize(text)
                 state.metrics.hosted_llm_used = True
+                state.v2_candidate_result = "promoted"
                 logger.info("V2 ROUTE turn={} route=speculation-hit action={} state={}", state.turn_id, plan.action, self.session.state.get("name"))
                 pcm = await self._commit_spec_audio(candidate, self._fingerprint(text, plan))
                 if pcm:
@@ -503,6 +584,7 @@ class V2RoutingController(StreamingVoiceController):
                 return
 
         if candidate:
+            state.v2_candidate_result = "rejected"
             self._cancel_task(candidate.task)
             await self._abort_spec_audio(candidate)
             state.metrics.speculative_started_at = None
@@ -512,6 +594,8 @@ class V2RoutingController(StreamingVoiceController):
             state.metrics.first_filtered_text_at = None
             state.metrics.first_safe_text_at = None
         state.candidate = None
+        if not hasattr(state, "v2_candidate_result"):
+            state.v2_candidate_result = "none"
         state.metrics.speculation = "miss" if candidate else "none"
         state.metrics.route = "v2-" + plan.route
         logger.info("V2 ROUTE turn={} route={} action={} state={}", state.turn_id, plan.route, plan.action, self.session.state.get("name"))
@@ -521,6 +605,10 @@ class V2RoutingController(StreamingVoiceController):
         request = LLMRequest(text, speculative=False)
         request.v2_plan = plan
         request.v2_slots = self.session.visible_facts()
+        request.v2_source = "final"
+        self._prepare_request(
+            state, request, text, slots_before=state.v2_slots_before
+        )
         state.metrics.hosted_llm_used = True
         state.final_request = request
         request.task = asyncio.create_task(self._generate(state, text, plan, request=request))
@@ -699,7 +787,11 @@ class V2RoutingController(StreamingVoiceController):
             return True
         return final_words == basis_words
 
-    def _messages(self, text: str, plan: ResponsePlan, *, slots: dict | None = None) -> list[dict[str, str]]:
+    def _messages(
+        self, text: str, plan: ResponsePlan, *, slots: dict | None = None,
+        history: list[dict[str, str]] | None = None,
+        diagnostics: dict | None = None,
+    ) -> list[dict[str, str]]:
         contract = (
             "Runtime output contract: Output spoken text only, without control markers. "
             "The runtime owns call termination. Do not claim a callback was scheduled or an action completed without a verified tool result. "
@@ -707,16 +799,28 @@ class V2RoutingController(StreamingVoiceController):
             "Avoid introductions such as 'Thank you for sharing', 'I understand', and 'Based on the information'. Use short spoken sentences and ask at most one question. "
             "Do not repeat information the caller already provided. Total response must be under 100 characters. Do not repeat the pitch, invent a company name, or treat uncertainty as consent."
         )
-        documents = self._knowledge_for(text, plan)
+        matches = self._knowledge_matches(text, plan)
         if plan.knowledge_ids:
-            documents = [document for document in documents if document.document_id in plan.knowledge_ids]
+            matches = [m for m in matches if m.record.document_id in plan.knowledge_ids]
+        
+        if diagnostics is not None:
+            diagnostics["retrieval"] = [
+                {
+                    "retrieval_query": text,
+                    "retrieval_confidence": match.score,
+                    "selected_doc_id": match.record.document_id,
+                }
+                for match in matches
+            ]
+
+        documents = [m.record for m in matches]
         messages = self.prompt_builder.build(
             agent=self.session.agent,
             state=self.session.state,
             slots=slots if slots is not None else self.session.slots,
             route=plan,
             knowledge=documents,
-            history=self.session.history,
+            history=self.session.history if history is None else history,
             user_text=text,
         )
         messages[0]["content"] += "\n\n" + contract
@@ -728,7 +832,8 @@ class V2RoutingController(StreamingVoiceController):
         stream = None
         started = False
         speech_filter = SpeechStreamFilter()
-        booking_guard = BookingClaimGuard() if plan.requires_booking_guard else None
+        from voice_agent.speech.booking_guard import BookingClaimGuard
+        booking_guard = BookingClaimGuard()
         chunker = SafeSpeechChunker(
             min_chars=self._safe_chunk_chars,
             min_words=self._safe_chunk_words,
@@ -805,10 +910,63 @@ class V2RoutingController(StreamingVoiceController):
             if state.metrics.speculative_started_at is None:
                 state.metrics.speculative_started_at = time.perf_counter()
             state.metrics.llm_request_started_at = time.perf_counter()
+            t_build_start = time.perf_counter()
+            diagnostics = {}
+            messages = self._messages(
+                text,
+                plan,
+                slots=getattr(request, "v2_slots", None),
+                history=getattr(request, "v2_history", None),
+                diagnostics=diagnostics,
+            )
+            
+            def _norm(s):
+                return " ".join(s.casefold().split())
+            user_msg_count = sum(1 for m in messages if m["role"] == "user" and _norm(m["content"]) == _norm(text))
+            dedup_success = (user_msg_count == 1)
+            logger.debug("V2 CONTEXT DEDUP | turn={} context_current_user_deduplicated={}", state.turn_id, str(dedup_success).lower())
+            state.metrics.prompt_build_ms = round((time.perf_counter() - t_build_start) * 1000, 2)
+            
+            ctx_metrics = getattr(request, "v2_context_metrics", {})
+            state.metrics.pipecat_context_read_ms = ctx_metrics.get("pipecat_context_read_ms", 0.0)
+            state.metrics.context_selection_ms = ctx_metrics.get("context_selection_ms", 0.0)
+            state.metrics.context_token_estimation_ms = ctx_metrics.get("context_token_estimation_ms", 0.0)
+            
+            if self._log_llm_payloads:
+                payload = {
+                    "turn_id": state.turn_id,
+                    "request_id": getattr(request, "v2_request_id", None),
+                    "attempt": getattr(request, "v2_attempt", 1),
+                    "request_kind": "speculative" if request.speculative else "final",
+                    "transcript_source": getattr(request, "v2_source", "final"),
+                    "transcript": text,
+                    "state": str(self.session.state.get("name", "OPEN")),
+                    "pending_question": self._pending_payload(self.session.pending_question),
+                    "intent": plan.intent_id or "unknown",
+                    "slots_before": getattr(request, "v2_slots_before", {}),
+                    "history_sent": getattr(request, "v2_history", []),
+                    "messages_sent": messages,
+                    "context": ctx_metrics,
+                    "diagnostics": diagnostics,
+                }
+                logger.debug(
+                    "V2 LLM REQUEST | {}",
+                    self.prompt_builder._safe_json_dumps(payload),
+                )
+            else:
+                logger.debug(
+                    "V2 LLM REQUEST | turn={} request_kind={} transcript_source={} intent={} prompt_build_ms={} retrieval={}",
+                    state.turn_id,
+                    "speculative" if request.speculative else "final",
+                    getattr(request, "v2_source", "final"),
+                    plan.intent_id or "unknown",
+                    state.metrics.prompt_build_ms,
+                    self.prompt_builder._safe_json_dumps(diagnostics.get("retrieval", [])),
+                )
             async with asyncio.timeout(20):
                 stream = await self._client.chat.completions.create(
                     model=self._model,
-                    messages=self._messages(text, plan, slots=getattr(request, "v2_slots", None)),
+                    messages=messages,
                     stream=True,
                     temperature=0,
                     max_completion_tokens=self._llm_max_tokens,
@@ -917,9 +1075,118 @@ class V2RoutingController(StreamingVoiceController):
             name=f"v2-spec-tts-{state.turn_id}",
         )
 
+    def _pending_from_speech(self, speech: str, turn_id: int) -> PendingQuestion | None:
+        """Attach semantic meaning to a generated question for later replies."""
+        value = normalize(speech)
+        if "?" not in speech:
+            return None
+        patterns = (
+            (r"\b(?:what day and time|day and time|preferred day|what time)\b", "ask_callback_day_time", "callback_preference", "date_and_time"),
+            (r"\b(?:arrange|follow up|callback|call you back)\b", "ask_callback_consent", "followup_consent", "boolean"),
+            (r"\b(?:hiring now|planning to hire|hire soon)\b", "ask_hiring_status", "hiring_status", "boolean"),
+            (r"\b(?:what roles|which roles|roles are you)\b", "ask_roles", "roles", "list"),
+            (r"\b(?:how many|roughly how many|headcount)\b", "ask_headcount", "headcount", "integer_or_range"),
+            (r"\b(?:would you like details|interested|want details)\b", "ask_service_details", "service_details", "boolean"),
+        )
+        for pattern, intent, slot, expected in patterns:
+            if re.search(pattern, value):
+                return PendingQuestion(intent, slot, expected, turn_id)
+        return PendingQuestion("ask_conversation_reply", "conversation_reply", "string", turn_id)
+
+    def _stage_delivery(self, state, speech: str, plan: ResponsePlan) -> None:
+        request = state.final_request or state.candidate
+        response_id = str(getattr(request, "v2_request_id", "") or uuid.uuid4().hex)
+        pending = plan.pending_question or self._pending_from_speech(speech, state.turn_id)
+        self._planned_pending_question = pending
+        self._delivery_state = state
+        self._delivery_speech = speech
+        if pending is not None or plan.clear_pending_question:
+            # The prior question has been answered. A replacement question is
+            # activated only by the assistant aggregator after output.
+            self.session.pending_question = None
+        self.session.assistant_delivery = AssistantDeliveryState(
+            response_id=response_id,
+            plan_intent=plan.intent_id,
+            generated_text=speech,
+            question_id=(f"{state.turn_id}:{pending.slot}" if pending else None),
+        )
+
+    async def handle_assistant_turn_stopped(self, *, content: str, interrupted: bool) -> None:
+        delivery = self.session.assistant_delivery
+        if delivery is None:
+            return
+        delivery.spoken_text = content
+        delivery.interrupted = interrupted
+        pending = self._planned_pending_question
+        if pending is not None and not interrupted and content.strip():
+            self.session.pending_question = pending
+            logger.debug(
+                "V2 QUESTION ACTIVATED | turn={} slot={} response_id={}",
+                self.session.turn_id, pending.slot, delivery.response_id,
+            )
+        elif pending is not None:
+            logger.info(
+                "V2 QUESTION CANCELLED | turn={} slot={} interrupted={}",
+                self.session.turn_id, pending.slot, interrupted,
+            )
+        self._planned_pending_question = None
+        logger.debug(
+            "V2 ASSISTANT TURN | turn={} response_id={} interrupted={} content_chars={}",
+            self.session.turn_id, delivery.response_id, interrupted, len(content),
+        )
+        if self._delivery_state is not None:
+            self._log_turn_finalized(self._delivery_state, self._delivery_speech)
+        self._delivery_state = None
+        self._delivery_speech = ""
+
+    def _state_consistency(self, speech: str) -> str:
+        """Flag obvious callback text/state disagreement in finalization logs."""
+        preference = normalize(str(self.session.slots.get("callback_preference") or ""))
+        if not preference:
+            return "not_checked"
+        days = re.findall(
+            r"\b(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+            normalize(speech),
+        )
+        if days and any(day not in preference for day in days):
+            return "mismatch"
+        return "match" if days else "not_checked"
+
+    def _log_turn_finalized(self, state, speech: str) -> None:
+        if getattr(state, "v2_finalization_logged", False):
+            return
+        state.v2_finalization_logged = True
+        request = state.final_request or state.candidate
+        payload = {
+            "turn_id": state.turn_id,
+            "request_id": getattr(request, "v2_request_id", None),
+            "final_transcript": state.final_transcript,
+            "candidate_result": getattr(state, "v2_candidate_result", "none"),
+            "slots_before": getattr(state, "v2_slots_before", {}),
+            "slots_after": self.session.visible_facts(),
+            "generated_response": speech,
+            "spoken_response": (
+                self.session.assistant_delivery.spoken_text
+                if self.session.assistant_delivery else ""
+            ),
+            "assistant_interrupted": (
+                self.session.assistant_delivery.interrupted
+                if self.session.assistant_delivery else False
+            ),
+            "pending_question_after": self._pending_payload(self.session.pending_question),
+            "state_consistency": self._state_consistency(speech),
+        }
+        logger.info(
+            "V2 TURN FINALIZED | {}",
+            self.prompt_builder._safe_json_dumps(payload),
+        )
+
     async def _deliver(self, state, speech: str, plan: ResponsePlan) -> None:
         if self._state is not state or state.answer_finished:
             return
+        from voice_agent.speech.booking_guard import BookingClaimGuard
+        speech = BookingClaimGuard.check(speech)
+        self._stage_delivery(state, speech, plan)
         await self._speak_fixed(state, speech)
         self._remember(state, speech)
         self._apply_plan(plan)
@@ -954,6 +1221,7 @@ class V2RoutingController(StreamingVoiceController):
             return
         state.metrics.tts_requested_at = time.perf_counter()
         state.answer_finished = True
+        self._stage_delivery(state, speech, plan)
         await self.push_frame(LLMFullResponseStartFrame())
         for chunk in chunks:
             await self.push_frame(LLMTextFrame(chunk))
@@ -1087,6 +1355,7 @@ class V2RoutingController(StreamingVoiceController):
         if self._state is not state or state.answer_finished:
             return
         state.answer_finished = True
+        self._stage_delivery(state, speech, plan)
         await self.push_frame(LLMFullResponseEndFrame())
         # A private PCM-only candidate has no public Cartesia context to emit
         # this marker. Without it the output transport would remain speaking.
@@ -1105,10 +1374,8 @@ class V2RoutingController(StreamingVoiceController):
         """Commit deterministic state only after the validated response is released."""
         if plan.next_state:
             self.session.state["name"] = plan.next_state
-        if plan.clear_pending_question:
+        if plan.clear_pending_question and plan.pending_question is None:
             self.session.pending_question = None
-        if plan.pending_question is not None:
-            self.session.pending_question = plan.pending_question
         for name, value in plan.slots_written.items():
             schema = self.session.agent.slot_schema.get(name, {})
             validation = self.slot_validator.validate(schema, value)
