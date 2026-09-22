@@ -1,0 +1,16 @@
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.runtime-cache/
+logs/
+
+.DS_Store
+scratch_config.json
+pipecat-memory-revamp.md
+tests/

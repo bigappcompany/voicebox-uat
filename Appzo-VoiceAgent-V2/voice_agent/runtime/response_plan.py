@@ -16,6 +16,9 @@ class ResponsePlan:
     risk_class: str = "LOW_PUBLIC"
     slots_read: tuple[str, ...] = ()
     slots_written: dict[str, Any] = field(default_factory=dict)
+    # State transitions may need to retract obsolete values (for example a
+    # declined callback must not retain a previously proposed day and time).
+    slots_cleared: tuple[str, ...] = ()
     knowledge_ids: tuple[str, ...] = ()
     tool_name: str | None = None
     cache_key: str | None = None

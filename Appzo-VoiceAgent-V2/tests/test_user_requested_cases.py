@@ -77,6 +77,20 @@ class TestUserRequestedCases(unittest.TestCase):
         self.assertEqual(update.values["roles"], ["operations"])
         self.assertEqual(update.values["headcount"], NumericRange(3, 4, "people", True))
 
+    def test_compound_departments_keep_each_role_headcount(self):
+        update = self.fe.extract(
+            "six to seven people in the tech department and a couple people in the office department",
+            {},
+        )
+        self.assertEqual(update.values["roles"], ["office", "technology"])
+        self.assertEqual(update.values["departments"], ["office", "technology"])
+        self.assertEqual(
+            update.values["headcount_by_role"]["technology"],
+            NumericRange(6, 7, "people", True),
+        )
+        self.assertEqual(update.values["headcount_by_role"]["office"], 2)
+        self.assertEqual(update.values["headcount"], NumericRange(8, 9, "people", True))
+
     def test_case_8_in_three_to_four_months(self):
         current = {"hiring_timeline": NumericRange(3, 4, "months")}
         update = self.fe.extract("in three to four months", current)
@@ -166,6 +180,14 @@ class TestUserRequestedCases(unittest.TestCase):
         self.assertEqual(plan.slots_written["callback_day"], "wednesday")
         self.assertEqual(plan.slots_written["callback_preference"], "wednesday at five pm")
         self.assertIn("wednesday", speech.casefold())
+
+    def test_preference_recorded_does_not_hijack_a_long_acknowledgement(self):
+        slots = {
+            "callback_state": self.callbacks.PREFERENCE_RECORDED,
+            "callback_preference": "thursday at one pm",
+        }
+        match = self.im.classify("okay also building a larger engineering team", fact_values=slots)
+        self.assertNotEqual(match.intent_id, "callback_consent_yes")
 
     def test_latest_day_wins_inside_correction_utterance(self):
         pending = PendingQuestion("ask_callback_day_time", "callback_preference", "date_and_time", 1)

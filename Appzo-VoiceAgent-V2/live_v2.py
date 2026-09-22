@@ -46,6 +46,10 @@ from voice_agent.speech.booking_guard import BookingClaimGuard
 from voice_agent.turns.transcript_stability import TranscriptStabilityAnalyzer
 from voice_agent.turns.endpoint_profiles import profile_for_prompt
 
+_LOW_INFO_FRAGMENTS = frozenset({
+    "hiria", "very", "uh", "um", "ah", "hmm", "ha", "er", "oh", "huh",
+})
+
 
 class V2RoutingController(StreamingVoiceController):
     def __init__(
@@ -136,17 +140,40 @@ class V2RoutingController(StreamingVoiceController):
         self._min_final_transcript_chars = int(os.getenv("V2_MIN_FINAL_TRANSCRIPT_CHARS", "2"))
         self._spec_restart_min_new_words = int(os.getenv("V2_SPEC_RESTART_MIN_NEW_WORDS", "3"))
         self._min_useful_spec_lead_ms = int(os.getenv("V2_MIN_USEFUL_SPEC_LEAD_MS", "100"))
+        # This is an operator budget, not a filler trigger. A hosted model
+        # that misses it is visible in the per-turn record; deterministic and
+        # promoted speculative candidates have already been considered before
+        # this request is allowed to own caller-facing speech.
+        self._hosted_ttft_observe_ms = int(os.getenv("V2_HOSTED_TTFT_OBSERVE_MS", "350"))
         self._spec_tts_commit_wait_secs = float(os.getenv("V2_SPEC_TTS_COMMIT_WAIT_MS", "40")) / 1000
+        # A post-promotion first phrase is the only point where normal TTS is
+        # deliberately held for private PCM. This needs a realistic Cartesia
+        # first-audio budget, while the original pre-EOT path stays at 40 ms.
+        self._late_spec_tts_wait_secs = float(os.getenv("V2_LATE_SPEC_TTS_WAIT_MS", "400")) / 1000
+        self._endpoint_profile = None
         self._endpoint_profile_updater = None
+        self._prefix_buffer = ""
         self._enable_spec_tts = self.flags.enable_spec_tts
         self._spec_audio: SpeculativeCartesiaBuffer | None = None
         if self._enable_spec_tts and self._streaming and cartesia_api_key and cartesia_voice_id and cartesia_model:
+            requested_spec_audio_ms = int(os.getenv("V2_SPEC_TTS_MAX_AUDIO_MS", "2000"))
+            # Older deployments used 600 ms because partial PCM was treated
+            # as committable. Complete-phrase commit needs enough room for a
+            # short 2-6 word safe chunk; retain the setting as an upper bound
+            # knob while migrating unsafe legacy values to a safe minimum.
+            spec_audio_ms = max(2000, requested_spec_audio_ms)
+            if spec_audio_ms != requested_spec_audio_ms:
+                logger.warning(
+                    "V2 speculative TTS audio cap raised from {} ms to {} ms for complete-phrase safety",
+                    requested_spec_audio_ms,
+                    spec_audio_ms,
+                )
             self._spec_audio = SpeculativeCartesiaBuffer(
                 api_key=cartesia_api_key,
                 voice_id=cartesia_voice_id,
                 model=cartesia_model,
                 speed=cartesia_speed,
-                max_audio_ms=int(os.getenv("V2_SPEC_TTS_MAX_AUDIO_MS", "600")),
+                max_audio_ms=spec_audio_ms,
                 connect_timeout_secs=float(os.getenv("V2_SPEC_TTS_CONNECT_TIMEOUT_SECS", "4")),
             )
             # Connection establishment is outside the EOT-to-audio path. If a
@@ -286,6 +313,10 @@ class V2RoutingController(StreamingVoiceController):
         if not interim:
             return
         state.latest_interim = interim
+        if getattr(self, "_endpoint_profile", None) == "yes_no" and len(interim.strip().split()) >= 3:
+            self._endpoint_profile = "freeform"
+            if self._endpoint_profile_updater:
+                asyncio.create_task(self._endpoint_profile_updater("freeform"))
         hypothesis = self._stability.update(interim)
         eager = self._flux_mode and self._flux_eager
         if eager:
@@ -461,6 +492,9 @@ class V2RoutingController(StreamingVoiceController):
         await asyncio.sleep(0 if self._stt_finalized else self._settle_seconds)
         text, self._pending_text = self._pending_text, ""
         self._latest_finalized_text = ""
+        if self._prefix_buffer:
+            text = f"{self._prefix_buffer} {text}".strip()
+            self._prefix_buffer = ""
         normalized = normalize(text)
         if normalized and len(normalized) < self._min_final_transcript_chars:
             # Flux occasionally finalizes a one-character noise fragment. It
@@ -470,6 +504,14 @@ class V2RoutingController(StreamingVoiceController):
                 self._state.committed = True
                 self._state.metrics.route = "stt-noise-ignored"
             logger.info("V2 ignored short final transcript chars={}", len(normalized))
+            return
+        words = normalized.split()
+        if words and all(w in _LOW_INFO_FRAGMENTS for w in words):
+            self._prefix_buffer = text
+            if self._state and not self._state.committed:
+                self._state.committed = True
+                self._state.metrics.route = "stt-low-info-buffered"
+            logger.info("V2 buffered low-information fragment: {}", text)
             return
         await super().handle_native_turn_stopped(text)
 
@@ -578,24 +620,39 @@ class V2RoutingController(StreamingVoiceController):
             if candidate.task is None or (candidate.task.done() and not candidate.answer_chunks and not candidate.completed):
                 pass
             else:
-                state.metrics.route = "v2-speculation-hit"
+                safe_text_at = getattr(candidate, "first_safe_text_at", None) or state.metrics.first_safe_text_at
+                commit_time = state.metrics.turn_committed_at or time.perf_counter()
+                has_safe_text_at_eot = safe_text_at is not None and safe_text_at <= (commit_time + 0.05)
                 lead_ms = (
-                    (state.metrics.turn_committed_at - state.metrics.speculative_started_at) * 1000
-                    if state.metrics.turn_committed_at is not None
-                    and state.metrics.speculative_started_at is not None
+                    (commit_time - state.metrics.speculative_started_at) * 1000
+                    if state.metrics.speculative_started_at is not None
                     else None
                 )
                 useful_speculation = lead_ms is not None and lead_ms >= self._min_useful_spec_lead_ms
-                state.metrics.speculation = "hit" if useful_speculation else "late-reuse"
-                if not useful_speculation and state.metrics.spec_tts not in {"hit", "pcm_ready"}:
-                    state.metrics.spec_tts_eligible = False
-                    state.metrics.spec_tts = "not_eligible"
-                    state.metrics.spec_tts_reason = "insufficient_speculation_lead"
+                if has_safe_text_at_eot:
+                    route_name = "speculation-hit"
+                    state.metrics.speculation = "hit" if useful_speculation else "hit"
+                    state.metrics.route = "v2-speculation-hit"
+                else:
+                    route_name = "late-reuse"
+                    state.metrics.speculation = "late-reuse"
+                    state.metrics.route = "v2-late-reuse"
+                    if not useful_speculation and state.metrics.spec_tts not in {"hit", "pcm_ready"}:
+                        state.metrics.spec_tts_eligible = False
+                        state.metrics.spec_tts = "not_eligible"
+                        state.metrics.spec_tts_reason = "insufficient_speculation_lead"
                 state.metrics.semantic_spec_reused = normalize(candidate.transcript) != normalize(text)
                 state.metrics.hosted_llm_used = True
                 state.v2_candidate_result = "promoted"
-                logger.info("V2 ROUTE turn={} route=speculation-hit action={} state={}", state.turn_id, plan.action, self.session.state.get("name"))
-                pcm = await self._commit_spec_audio(candidate, self._fingerprint(text, plan))
+                logger.info("V2 ROUTE turn={} route={} action={} state={}", state.turn_id, route_name, plan.action, self.session.state.get("name"))
+                # Preserve the validated final fingerprint even when the LLM
+                # has not produced a safe phrase yet.  A promoted candidate
+                # can then race private Cartesia against the public path when
+                # that first phrase arrives, rather than losing speculative
+                # TTS merely because hard EOT came first.
+                final_fingerprint = self._fingerprint(text, plan)
+                candidate.v2_final_fingerprint = final_fingerprint
+                pcm = await self._commit_spec_audio(candidate, final_fingerprint)
                 if pcm:
                     state.metrics.speculation = "hit+tts"
                 state.metrics.candidate_promoted_at = time.perf_counter()
@@ -646,7 +703,6 @@ class V2RoutingController(StreamingVoiceController):
                 CallbackCoordinator.AWAITING_DAY_TIME: ("ask_callback_day_time", "callback_preference", "date_and_time"),
                 CallbackCoordinator.AWAITING_DAY: ("ask_callback_day", "callback_day", "date"),
                 CallbackCoordinator.AWAITING_TIME: ("ask_callback_time", "callback_time", "time"),
-                CallbackCoordinator.PREFERENCE_RECORDED: ("ask_callback_consent", "followup_consent", "boolean"),
             }.get(callback_state)
             if callback_pending:
                 pending_question = PendingQuestion(*callback_pending, self.session.turn_id)
@@ -933,8 +989,19 @@ class V2RoutingController(StreamingVoiceController):
                 gap_ms,
                 request.speculative,
             )
+            # Normally private synthesis begins while the request is still
+            # speculative. A zero-delay hard-EOT promotion, however, can
+            # precede the LLM's first safe phrase. Keep that *first* promoted
+            # phrase eligible for the same private-TTS race; no later public
+            # phrase is ever synthesized privately.
+            can_late_prepare = bool(
+                request.public_response_started
+                and not request.normal_tts_text_sent
+                and not request.private_pcm_committed
+                and getattr(request, "v2_final_fingerprint", "")
+            )
             if (
-                request.speculative
+                (request.speculative or can_late_prepare)
                 and self._spec_audio
                 and request.spec_audio is None
                 and request.spec_audio_task is None
@@ -948,6 +1015,7 @@ class V2RoutingController(StreamingVoiceController):
                     or getattr(request, "v2_source", "") == "eager"
                 )
             ):
+                state.metrics.spec_tts_eligible = True
                 state.metrics.spec_tts_started_at = time.perf_counter()
                 state.metrics.spec_tts = "started"
                 state.metrics.spec_tts_reason = "private_synthesis_in_progress"
@@ -972,6 +1040,25 @@ class V2RoutingController(StreamingVoiceController):
                     if state.metrics.response_release_at is None:
                         state.metrics.response_release_at = time.perf_counter()
                     await self.push_frame(LLMFullResponseStartFrame())
+            # For a candidate promoted before it had text, give its freshly
+            # started private Cartesia request a small, bounded head start.
+            # If it has PCM, emit that directly; otherwise this falls through
+            # to normal streaming TTS without delaying the rest of the turn.
+            if can_late_prepare and request.spec_audio_task is not None:
+                pcm = await self._commit_spec_audio(
+                    request,
+                    getattr(request, "v2_final_fingerprint"),
+                    wait_secs=self._late_spec_tts_wait_secs,
+                )
+                if pcm:
+                    request.private_pcm_committed = True
+                    request.last_tts_text = chunk.strip()
+                    state.metrics.speculation = "hit+tts"
+                    for audio in pcm:
+                        await self.push_frame(
+                            TTSAudioRawFrame(audio=audio, sample_rate=24000, num_channels=1)
+                        )
+                    return
             if state.metrics.tts_requested_at is None:
                 state.metrics.tts_requested_at = time.perf_counter()
             await self.push_frame(LLMTextFrame(self._tts_delta(request, chunk)))
@@ -1059,6 +1146,20 @@ class V2RoutingController(StreamingVoiceController):
                         continue
                     if state.metrics.llm_first_token_at is None:
                         state.metrics.llm_first_token_at = time.perf_counter()
+                        ttft_ms = round(
+                            (state.metrics.llm_first_token_at - state.metrics.llm_request_started_at) * 1000,
+                            1,
+                        ) if state.metrics.llm_request_started_at is not None else None
+                        if ttft_ms is not None and ttft_ms > self._hosted_ttft_observe_ms:
+                            logger.warning(
+                                "V2 HOSTED TTFT BUDGET EXCEEDED | turn={} ttft_ms={} budget_ms={} speculative={} "
+                                "direct_routes_checked=true hedge_enabled={}",
+                                state.turn_id,
+                                ttft_ms,
+                                self._hosted_ttft_observe_ms,
+                                request.speculative,
+                                self.flags.enable_hedged_models,
+                            )
                     filtered = speech_filter.push(content)
                     if filtered and state.metrics.first_speech_filter_text_at is None:
                         state.metrics.first_speech_filter_text_at = time.perf_counter()
@@ -1138,10 +1239,14 @@ class V2RoutingController(StreamingVoiceController):
         candidate_audio = getattr(prepared, "candidate", None)
         if (
             self._state is state and not request.spec_audio_invalidated
+            and not getattr(prepared, "failed", False)
+            and getattr(prepared, "completed", True)
             and (candidate_audio is None or candidate_audio.pcm_chunks)
         ):
             first_audio_at = getattr(prepared, "first_audio_at", None)
-            state.metrics.spec_tts_pcm_ready_at = first_audio_at or time.perf_counter()
+            state.metrics.spec_tts_pcm_ready_at = (
+                getattr(prepared, "completed_at", None) or time.perf_counter()
+            )
             state.metrics.spec_tts_first_audio_at = first_audio_at
             state.metrics.spec_tts = "pcm_ready"
             state.metrics.spec_tts_reason = "private_pcm_buffered"
@@ -1158,6 +1263,7 @@ class V2RoutingController(StreamingVoiceController):
             return
         chunk = request.answer_chunks[0]
         state.metrics.spec_tts_started_at = time.perf_counter()
+        state.metrics.spec_tts_eligible = True
         state.metrics.spec_tts = "started"
         state.metrics.spec_tts_reason = "private_synthesis_in_progress"
         request.spec_audio_text = chunk
@@ -1305,6 +1411,8 @@ class V2RoutingController(StreamingVoiceController):
         states = self.session.agent.flow_graph.get("states") or {}
         state_config = states.get(state_name, {}) if isinstance(states, dict) else {}
         name = str(state_config.get("endpoint_profile") or profile_for_prompt(speech))
+        if name == "yes_no" and self.session.pending_question and self.session.pending_question.expected_type not in {"boolean", "yes_no"}:
+            name = "freeform"
         stt_profile = self.session.agent.stt_profile or {}
         terms = list(stt_profile.get("keyterms") or [])
         state_terms = stt_profile.get("state_keyterms") or {}
@@ -1341,26 +1449,31 @@ class V2RoutingController(StreamingVoiceController):
         if plan.action == "end_call":
             await self.push_frame(EndFrame())
 
-    async def _commit_spec_audio(self, request: LLMRequest, fingerprint: str) -> list[bytes] | None:
-        prepared_candidate = getattr(request.spec_audio, "candidate", None)
-        prepared_has_pcm = bool(
-            request.spec_audio is not None
-            and (prepared_candidate is None or prepared_candidate.pcm_chunks)
-        )
+    async def _commit_spec_audio(
+        self, request: LLMRequest, fingerprint: str, *, wait_secs: float | None = None
+    ) -> list[bytes] | None:
+        def complete_pcm_ready() -> bool:
+            prepared = request.spec_audio
+            candidate_audio = getattr(prepared, "candidate", None)
+            return bool(
+                prepared is not None
+                and not getattr(prepared, "failed", False)
+                and getattr(prepared, "completed", True)
+                and (candidate_audio is None or candidate_audio.pcm_chunks)
+            )
+
+        prepared_has_pcm = complete_pcm_ready()
         if request.spec_audio_task and not request.spec_audio_task.done() and not prepared_has_pcm:
-            if self._spec_tts_commit_wait_secs > 0:
+            commit_wait_secs = self._spec_tts_commit_wait_secs if wait_secs is None else wait_secs
+            if commit_wait_secs > 0:
                 try:
                     await asyncio.wait_for(
                         asyncio.shield(request.spec_audio_task),
-                        timeout=self._spec_tts_commit_wait_secs,
+                        timeout=commit_wait_secs,
                     )
                 except TimeoutError:
                     pass
-            prepared_candidate = getattr(request.spec_audio, "candidate", None)
-            prepared_has_pcm = bool(
-                request.spec_audio is not None
-                and (prepared_candidate is None or prepared_candidate.pcm_chunks)
-            )
+            prepared_has_pcm = complete_pcm_ready()
             if not prepared_has_pcm:
                 request.spec_audio_invalidated = True
                 if self._state:
@@ -1379,8 +1492,15 @@ class V2RoutingController(StreamingVoiceController):
             if self._state and request.spec_audio_task is not None:
                 self._state.metrics.spec_tts = "not-ready"
             return None
+        if not complete_pcm_ready():
+            await self._spec_audio.abort(request.spec_audio)
+            if self._state:
+                self._state.metrics.spec_tts = "miss"
+                self._state.metrics.spec_tts_reason = "private_phrase_incomplete"
+            return None
         pcm = await self._spec_audio.commit(request.spec_audio, fingerprint=fingerprint)
         if pcm and self._state:
+            self._state.metrics.spec_tts_eligible = True
             self._state.metrics.spec_tts = "hit"
             self._state.metrics.spec_tts_reason = "fingerprint_validated"
             self._state.metrics.spec_tts_first_audio_at = getattr(request.spec_audio, "first_audio_at", None)
@@ -1484,6 +1604,9 @@ class V2RoutingController(StreamingVoiceController):
             self.session.state["name"] = plan.next_state
         if plan.clear_pending_question and plan.pending_question is None:
             self.session.pending_question = None
+        for name in plan.slots_cleared:
+            self.session.slots.pop(name, None)
+            self.session.facts.pop(name, None)
         for name, value in plan.slots_written.items():
             schema = self.session.agent.slot_schema.get(name, {})
             validation = self.slot_validator.validate(schema, value)

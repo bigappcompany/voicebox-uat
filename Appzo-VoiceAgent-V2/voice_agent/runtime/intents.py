@@ -68,11 +68,59 @@ class CanonicalIntentModel:
         val = value.casefold()
         if re.search(r"\b(?:not sure|not certain|dont know|do not know|unsure|maybe|perhaps)\b", val):
             return "ambiguous"
+        if re.search(r"\b(?:no problem|no worries)\b", val):
+            return "yes"
         if re.search(r"\b(?:no|nope|not|dont|do not)\b", val):
             return "no"
         if re.search(r"\b(?:yes|yep|yup|yeah|sure|okay|ok|correct|true|go ahead|fine|sounds good|confirm it|that\s*'?\s*s\s+right|that\s*'?\s*s\s+correct|okay\s+that\s*'?\s*s\s+fine|that\s+is\s+right|that\s+is\s+correct)\b", val):
             return "yes"
         return "ambiguous"
+
+    def _is_standalone_boolean(self, value: str, current_facts: dict[str, Any] | None = None) -> bool:
+        norm = normalize_intent_text(value)
+        words = norm.split()
+        if not words:
+            return False
+
+        # If any domain facts were extracted (roles, headcount, timeline, callback preference, etc.),
+        # this utterance contains substantive information and is not a standalone boolean.
+        if current_facts:
+            substantive_keys = {
+                "roles", "departments", "headcount", "hiring_timeline",
+                "callback_day", "callback_time", "callback_preference", "headcount_by_role",
+            }
+            if any(current_facts.get(k) for k in substantive_keys):
+                return False
+
+        # Common non-standalone patterns (questions, corrections, follow-up requests)
+        if re.search(
+            r"\b(?:what|how|why|when|where|who|can you|could you|would you|tell me|give me|explain|missed|actually|rather|instead)\b",
+            norm,
+        ):
+            return False
+
+        # Standalone booleans are concise (typically 1-4 words).
+        if len(words) > 5:
+            return False
+
+        # Must parse to yes or no
+        bool_val = self._parse_boolean(norm)
+        if bool_val not in {"yes", "no"}:
+            return False
+
+        # Check that the tokens predominantly express affirmation or negation
+        boolean_tokens = {
+            "yes", "yep", "yup", "yeah", "sure", "okay", "ok", "please", "do",
+            "sounds", "good", "that", "thats", "that's", "works", "go", "ahead",
+            "fine", "correct", "right", "is", "true", "confirm", "it", "definitely",
+            "absolutely", "certainly", "no", "nope", "not", "now", "dont", "all",
+            "thanks", "thank", "you", "nothing", "else", "we", "i", "am", "are", "have",
+        }
+        non_bool = [w for w in words if w not in boolean_tokens]
+        if len(non_bool) > 1:
+            return False
+
+        return True
 
     def classify(
         self,
@@ -134,7 +182,7 @@ class CanonicalIntentModel:
             return IntentMatch("out_of_scope", .96, "domain_boundary")
         if re.search(r"\b(?:price|pricing|cost|charges|fee|fees)\b", value):
             return IntentMatch("faq_pricing", .94, "faq_phrase")
-        if re.search(r"\b(?:services|staffing|blue collar|white collar|job types|apprenticeships?)\b", value):
+        if re.search(r"\b(?:service(?:s)?|staffing|blue collar|white collar|job types|apprenticeships?)\b", value):
             return IntentMatch("faq_services", .94, "faq_phrase")
         if re.search(r"\b(?:agency|vendor|recruiter).*(?:already|existing|currently)\b", value):
             return IntentMatch("existing_agency", .9, "agency_phrase")
@@ -172,27 +220,46 @@ class CanonicalIntentModel:
             if clock:
                 return IntentMatch("callback_time", .95, "time_phrase", {"callback_time": clock.group(1).strip()})
 
-        bool_val = self._parse_boolean(value)
+        # Process explicit corrections and facts before pending boolean routing
+        if re.search(r"\b(?:actually|correction|make that|rather|i meant|you missed|missed out)\b", value):
+            if current_facts.get("roles") or current_facts.get("departments"):
+                return IntentMatch("provide_role", .99, "correction_fact")
+            if current_facts.get("headcount") is not None:
+                return IntentMatch("provide_headcount", .99, "correction_fact")
+            if current_facts.get("hiring_timeline") is not None:
+                return IntentMatch("provide_timeline", .99, "correction_fact")
+            return IntentMatch("correction", .95, "correction_marker")
+
+        # Explicit factual updates override pending questions
+        if current_facts.get("roles") or current_facts.get("departments"):
+            return IntentMatch("provide_role", .99, "fact_extractor")
+        if current_facts.get("headcount") is not None:
+            return IntentMatch("provide_headcount", .99, "fact_extractor")
+        if current_facts.get("hiring_timeline") is not None:
+            return IntentMatch("provide_timeline", .99, "fact_extractor")
+
+        is_standalone = self._is_standalone_boolean(value, current_facts)
+        bool_val = self._parse_boolean(value) if is_standalone else "ambiguous"
         if facts.get("callback_state") == "PREFERENCE_RECORDED" or (
             facts.get("callback_preference") and not pending_question
         ):
-            if bool_val == "yes" or value in self._yes or re.search(
-                r"\b(?:confirm(?:\s+it)?|sounds\s+good|that\s*'?\s*s\s+(?:correct|right|fine)|okay\s+that\s*'?\s*s\s+fine|correct|yes|yeah|yep|sure|fine)\b",
-                value,
-            ):
+            # Only a standalone acknowledgement belongs to a recorded
+            # preference. Do not hijack a new request that merely starts with
+            # "okay" or contains an affirmative word.
+            if value in self._yes:
                 return IntentMatch("callback_consent_yes", .995, "callback_confirmation")
-        if pending_type == "boolean" and pending_slot == "conversation_continue":
+        if is_standalone and pending_type == "boolean" and pending_slot == "conversation_continue":
             if bool_val == "yes":
                 return IntentMatch("conversation_continue_yes", .995, "pending_question")
             if bool_val == "no":
                 return IntentMatch("conversation_continue_no", .995, "pending_question")
-        if pending_intent in {"offer_callback", "ask_callback_consent"} or pending_slot in {"followup_consent", "callback_consent"}:
+        if is_standalone and (pending_intent in {"offer_callback", "ask_callback_consent"} or pending_slot in {"followup_consent", "callback_consent"}):
             if bool_val == "yes":
                 return IntentMatch("callback_consent_yes", .995, "pending_question")
             if bool_val == "no":
                 return IntentMatch("callback_consent_no", .995, "pending_question")
 
-        if pending_slot == "hiring_status":
+        if is_standalone and pending_slot == "hiring_status":
             if bool_val == "yes":
                 return IntentMatch("provide_hiring_status", .995, "pending_question", {"hiring_status": "yes"})
             if bool_val == "no":
@@ -210,14 +277,6 @@ class CanonicalIntentModel:
                 return IntentMatch("provide_timeline", .99, "pending_question")
             return IntentMatch("incomplete_response", .8, "pending_question")
 
-        if re.search(r"\b(?:actually|correction|make that|rather|i meant)\b", value):
-            return IntentMatch("correction", .9, "correction_marker")
-        if current_facts.get("headcount") is not None:
-            return IntentMatch("provide_headcount", .9, "fact_extractor")
-        if current_facts.get("roles") or current_facts.get("departments"):
-            return IntentMatch("provide_role", .9, "fact_extractor")
-        if current_facts.get("hiring_timeline") is not None:
-            return IntentMatch("provide_timeline", .9, "fact_extractor")
         if current_facts.get("hiring_status") is not None:
             return IntentMatch("provide_hiring_status", .9, "fact_extractor")
         return IntentMatch("unknown", 0.0, "no_high_confidence_match")

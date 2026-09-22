@@ -1,0 +1,15 @@
+agent_name = "voicebox-uat-new-v2"
+secret_set = "voicebox-uat-v2-secret"
+agent_profile = "agent-2x"
+region = "ap-south"
+max_session_duration = 900
+
+[git]
+repo = "bigappcompany/voicebox-uat"
+branch = "main"
+subdirectory = "Appzo-VoiceAgent-V2"
+dockerfile_path = "Dockerfile"
+
+[scaling]
+  min_agents = 1
+  max_agents = 50

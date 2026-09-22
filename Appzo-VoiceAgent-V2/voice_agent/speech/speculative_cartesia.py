@@ -35,6 +35,7 @@ class PreparedSpeculativeAudio:
     completed: bool = False
     failed: bool = False
     first_audio_at: float | None = None
+    completed_at: float | None = None
 
 
 class SpeculativeCartesiaBuffer:
@@ -141,15 +142,18 @@ class SpeculativeCartesiaBuffer:
     async def commit(
         self, prepared: PreparedSpeculativeAudio | None, *, fingerprint: str
     ) -> list[bytes] | None:
-        """Return private PCM only when the final fingerprint matches exactly."""
+        """Return only complete private PCM with an exact final fingerprint."""
         if prepared is None:
             return None
         candidate = prepared.candidate
-        if candidate.invalidated or candidate.fingerprint != fingerprint:
+        if (
+            candidate.invalidated
+            or candidate.fingerprint != fingerprint
+            or prepared.failed
+            or not prepared.completed
+        ):
             await self.abort(prepared)
             return None
-        # Hard EOT never waits for speculative synthesis. Prepared PCM is an
-        # optimization only; the public WebSocket is the immediate fallback.
         if not candidate.pcm_chunks:
             await self.abort(prepared)
             return None
@@ -242,13 +246,14 @@ class SpeculativeCartesiaBuffer:
                     if prepared.candidate.append(pcm, self._max_audio_ms):
                         if prepared.first_audio_at is None:
                             prepared.first_audio_at = time.perf_counter()
-                            prepared.ready.set()
                     else:
-                        # The cap is a successful partial preparation, not an
-                        # invalidation. Stop provider generation while keeping
-                        # already-buffered PCM eligible for hard-EOT commit.
+                        # Partial phrase audio is never safe to commit: the
+                        # caller cannot suppress the full text chunk without
+                        # clipping speech, nor replay it without duplication.
                         self._prepared.pop(prepared.context_id, None)
-                        prepared.completed = True
+                        prepared.failed = True
+                        prepared.candidate.invalidated = True
+                        prepared.candidate.pcm_chunks.clear()
                         prepared.ready.set()
                         try:
                             async with self._send_lock:
@@ -260,6 +265,7 @@ class SpeculativeCartesiaBuffer:
                             pass
                 elif kind in {"done", "flush_done"}:
                     prepared.completed = True
+                    prepared.completed_at = time.perf_counter()
                     prepared.ready.set()
                 elif kind == "error":
                     prepared.failed = True

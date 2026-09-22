@@ -7,6 +7,10 @@ services:
     container_name: appzo-voiceagent-v2
     init: true
     restart: unless-stopped
+    # Pipecat Cloud invokes bot.py through the base image. Local Compose keeps
+    # the existing Goodbox FastAPI/Plivo webhook server as its entrypoint.
+    entrypoint: ["python"]
+    command: ["goodbox_server.py"]
     env_file:
       - .env
     environment:

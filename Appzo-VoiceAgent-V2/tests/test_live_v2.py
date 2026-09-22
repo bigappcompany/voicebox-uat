@@ -9,6 +9,11 @@ from voice_agent.agents.bundle import AgentBundle
 from voice_agent.runtime.session import CallSession
 from voice_agent.runtime.session import PendingQuestion
 from voice_agent.runtime.response_plan import ResponsePlan
+from voice_agent.speech.audio_commit import SpeculativeAudioCandidate
+from voice_agent.speech.speculative_cartesia import (
+    PreparedSpeculativeAudio,
+    SpeculativeCartesiaBuffer,
+)
 from pipecat.frames.frames import (
     EndFrame,
     LLMFullResponseEndFrame,
@@ -248,7 +253,8 @@ class LiveRoutingTests(unittest.IsolatedAsyncioTestCase):
         state = await self.answer(
             "tomorrow three pm but first tell me what services you provide"
         )
-        self.assertEqual(state.metrics.route, "v2-hosted")
+        self.assertEqual(state.metrics.route, "v2-cache")
+        self.client.chat.completions.create.assert_not_awaited()
         self.assertEqual(self.controller.session.slots["callback_day"], "tomorrow")
         self.assertIn("three", self.controller.session.slots["callback_time"])
         self.assertEqual(
@@ -270,9 +276,19 @@ class LiveRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.controller.session.pending_question = PendingQuestion(
             "ask_callback_consent", "followup_consent", "boolean", 1
         )
+        self.controller.session.slots.update(
+            {
+                "callback_day": "thursday",
+                "callback_time": "one pm",
+                "callback_preference": "thursday at one pm",
+            }
+        )
         no_state = await self.answer("yeah no dont do that")
         self.assertEqual(no_state.metrics.route, "v2-fixed")
         self.assertEqual(self.controller.session.slots["followup_consent"], "no")
+        self.assertNotIn("callback_day", self.controller.session.slots)
+        self.assertNotIn("callback_time", self.controller.session.slots)
+        self.assertNotIn("callback_preference", self.controller.session.slots)
         self.client.chat.completions.create.assert_not_awaited()
 
     def test_anything_else_question_is_not_callback_consent(self):
@@ -293,8 +309,10 @@ class LiveRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.metrics.route, "v2-callback-preference-acknowledged")
         self.client.chat.completions.create.assert_not_awaited()
         speech = self.controller.push_frame.await_args.args[0].text.casefold()
-        self.assertIn("requested follow-up time", speech)
-        self.assertIn("confirm availability", speech)
+        self.assertIn("anything else", speech)
+        self.assertEqual(self.controller.session.slots["callback_state"], "IDLE")
+        await self.controller.handle_assistant_turn_stopped(content=speech, interrupted=False)
+        self.assertEqual(self.controller.session.pending_question.slot, "conversation_continue")
 
     async def test_unrelated_time_is_not_a_callback(self):
         self.client.chat.completions.create.return_value = FakeStream(["What would you like to do then?"])
@@ -354,11 +372,11 @@ class LiveRoutingTests(unittest.IsolatedAsyncioTestCase):
         controller.push_frame = capture
         class SlowStream(FakeStream):
             async def chunks(self):
-                yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="We provide staffing support. "))])
+                yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="We provide permanent and contract staffing support. "))])
                 await asyncio.wait_for(released.wait(), 1)
                 yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="Which roles do you need?"))])
         self.client.chat.completions.create.return_value = SlowStream([])
-        await self.answer("tell me about staffing")
+        await self.answer("could you explain your policy please")
         self.assertTrue(released.is_set())
 
     async def test_stable_interim_response_is_released_only_after_matching_hard_eot(self):
@@ -449,7 +467,7 @@ class LiveRoutingTests(unittest.IsolatedAsyncioTestCase):
 
         self.controller._state.final_transcript = "we need four engineers"
         await self.controller._commit_final_turn(self.controller._state)
-        self.assertEqual(self.controller._state.metrics.route, "v2-speculation-hit")
+        self.assertEqual(self.controller._state.metrics.route, "v2-late-reuse")
         self.assertIs(self.controller._state.final_request, candidate)
         self.assertEqual(self.client.chat.completions.create.await_count, 1)
         self.assertTrue(
@@ -487,6 +505,97 @@ class LiveRoutingTests(unittest.IsolatedAsyncioTestCase):
         frames = [call.args[0] for call in self.controller.push_frame.await_args_list]
         self.assertTrue(any(isinstance(frame, TTSAudioRawFrame) for frame in frames))
         self.assertEqual(self.controller._state.metrics.speculation, "hit+tts")
+
+    async def test_promoted_candidate_can_race_private_tts_when_first_safe_text_arrives_late(self):
+        """Zero-delay promotion must not make speculative TTS unreachable."""
+        stream_started = asyncio.Event()
+        release_first_phrase = asyncio.Event()
+
+        class DelayedFirstPhrase(FakeStream):
+            async def chunks(self):
+                stream_started.set()
+                await release_first_phrase.wait()
+                yield SimpleNamespace(
+                    choices=[SimpleNamespace(delta=SimpleNamespace(content="We can help with that."))]
+                )
+
+        class PrivateCartesia:
+            def warm(self):
+                pass
+
+            async def prepare(self, **kwargs):
+                # Simulate private PCM arriving within the late-race budget.
+                await asyncio.sleep(0.01)
+                return SimpleNamespace(
+                    candidate=SimpleNamespace(pcm_chunks=[b"\x00\x00" * 240]),
+                    first_audio_at=None,
+                )
+
+            async def commit(self, prepared, *, fingerprint):
+                return list(prepared.candidate.pcm_chunks)
+
+            async def abort(self, _prepared):
+                pass
+
+            async def close(self):
+                pass
+
+        self.controller.router.extended = False
+        self.controller._spec_audio = PrivateCartesia()
+        self.client.chat.completions.create.return_value = DelayedFirstPhrase([])
+        await self.controller._on_interim("we need four")
+        await self.controller._on_interim("we need four engineers")
+        candidate = self.controller._state.candidate
+        await asyncio.wait_for(stream_started.wait(), 1)
+
+        self.controller._state.final_transcript = "we need four engineers"
+        await self.controller._commit_final_turn(self.controller._state)
+        self.assertFalse(candidate.speculative)
+
+        release_first_phrase.set()
+        await candidate.task
+        frames = [call.args[0] for call in self.controller.push_frame.await_args_list]
+        self.assertTrue(any(isinstance(frame, TTSAudioRawFrame) for frame in frames))
+        self.assertEqual(self.controller._state.metrics.spec_tts, "hit")
+        self.assertEqual(self.controller._state.metrics.speculation, "hit+tts")
+        self.assertTrue(self.controller._state.metrics.spec_tts_eligible)
+        self.assertFalse(any(
+            isinstance(frame, LLMTextFrame) and "We can help with that" in frame.text
+            for frame in frames
+        ))
+
+    async def test_private_cartesia_rejects_partial_phrase_pcm(self):
+        private = SpeculativeCartesiaBuffer(
+            api_key="test", voice_id="test", model="test", speed=1.0
+        )
+        candidate = SpeculativeAudioCandidate("fp", "basis", "Complete phrase.")
+        candidate.pcm_chunks.append(b"\x01\x00" * 240)
+        prepared = PreparedSpeculativeAudio(candidate, "context", "Complete phrase.")
+
+        pcm = await private.commit(prepared, fingerprint="fp")
+
+        self.assertIsNone(pcm)
+        self.assertTrue(candidate.invalidated)
+        self.assertFalse(candidate.pcm_chunks)
+
+    async def test_private_cartesia_commits_only_completed_phrase_pcm(self):
+        private = SpeculativeCartesiaBuffer(
+            api_key="test", voice_id="test", model="test", speed=1.0
+        )
+        audio = b"\x01\x00" * 240
+        candidate = SpeculativeAudioCandidate("fp", "basis", "Complete phrase.")
+        candidate.pcm_chunks.append(audio)
+        prepared = PreparedSpeculativeAudio(
+            candidate,
+            "context",
+            "Complete phrase.",
+            completed=True,
+        )
+
+        pcm = await private.commit(prepared, fingerprint="fp")
+
+        self.assertEqual(pcm, [audio])
+        self.assertTrue(candidate.committed)
 
     async def test_cartesia_retries_timeout_without_exposing_uri(self):
         from resilient_tts import ResilientCartesiaTTSService

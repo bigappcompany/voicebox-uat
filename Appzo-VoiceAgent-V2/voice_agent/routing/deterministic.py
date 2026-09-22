@@ -46,6 +46,34 @@ class DeterministicRouter:
         if not self.extended:
             return None
 
+        # These approved service facts are stable and low-risk. Serving them
+        # locally avoids an otherwise unnecessary hosted-model turn. If the
+        # caller also gave hiring facts, continue the collection workflow in
+        # the same response rather than losing those facts to the FAQ.
+        # Blue/white-collar coverage is deliberately not inferred from the
+        # generic services answer. Keep the explicit conservative fallback
+        # below so we never overstate support for those categories.
+        if intent_id == "faq_services" and not re.search(
+            r"\b(?:blue collar|white collar)\b", normalize_intent_text(text)
+        ):
+            service_speech = agent.cached_utterances.get(
+                "faq:services",
+                "We provide permanent, contract, IT staffing, and apprenticeships like NAPS and NATS.",
+            )
+            next_plan, next_speech = self._next_requirement(agent, slots, match, turn_id)
+            speech = f"{service_speech} {next_speech}".strip()
+            plan = ResponsePlan(
+                **{
+                    **next_plan.__dict__,
+                    "route": "cache",
+                    "intent_id": "faq_services",
+                    "cache_key": "faq:services",
+                    "decision_reason": "approved_services_faq",
+                    "decision_confidence": 1.0,
+                }
+            )
+            return plan, speech
+
         fixed = {
             "thank_you": ("thank_you", "You're welcome! Is there anything else I can help you with?", "continue"),
             "repeat": ("repeat", "Could you tell me which part you would like repeated?", "continue"),
@@ -89,6 +117,14 @@ class DeterministicRouter:
             )
 
         if intent_id == "unknown" and len(normalize_intent_text(text).split()) <= 2:
+            if str(slots.get("callback_state") or "") == "CLOSING":
+                return self._plan(
+                    "goodbye", "goodbye",
+                    "Thank you for your time. Goodbye.",
+                    action="end_call",
+                    writes={"callback_state": "CLOSED"},
+                    match=match,
+                )
             if str(slots.get("callback_state") or "") == "PREFERENCE_RECORDED":
                 pref = str(slots.get("callback_preference") or "your requested time")
                 return self._plan(
@@ -98,6 +134,10 @@ class DeterministicRouter:
                     writes={"callback_state": "PREFERENCE_RECORDED"},
                     match=match,
                 )
+            # In OPENING state or initial turn, suppress incomplete_response on unknown 1-2 word utterances
+            # so acoustic hallucinations / noise right after greeting do not reprompt
+            if turn_id <= 1 or str(slots.get("state") or "") == "OPENING" or (pending_question and pending_question.slot == "hiring_status"):
+                return None
             return self._plan(
                 "fixed", "incomplete_response",
                 "Could you tell me a little more about what you need help with?",
@@ -164,6 +204,19 @@ class DeterministicRouter:
                 next_state="CALLBACK",
                 pending=PendingQuestion("ask_callback_day_time", "callback_preference", "date_and_time", turn_id),
                 writes={"callback_state": "AWAITING_DAY_TIME", "followup_consent": "yes"},
+                match=match,
+            )
+
+        if (
+            str(slots.get("callback_state") or "") == "CLOSING"
+            and intent_id in {"callback_consent_yes", "callback_preference_acknowledged", "unknown", "thank_you"}
+        ):
+            return self._plan(
+                "goodbye",
+                "goodbye",
+                "Thank you for your time. Goodbye.",
+                action="end_call",
+                writes={"callback_state": "CLOSED"},
                 match=match,
             )
 

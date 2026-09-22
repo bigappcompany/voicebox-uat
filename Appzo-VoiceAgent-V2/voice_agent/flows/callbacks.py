@@ -16,6 +16,8 @@ class CallbackCoordinator:
     AWAITING_DAY = "AWAITING_DAY"
     AWAITING_TIME = "AWAITING_TIME"
     PREFERENCE_RECORDED = "PREFERENCE_RECORDED"
+    CLOSING = "CLOSING"
+    CLOSED = "CLOSED"
 
     def route(
         self,
@@ -48,6 +50,20 @@ class CallbackCoordinator:
         if intent_id == "goodbye":
             return None
 
+        if state == self.CLOSING:
+            if intent_id in {
+                "callback_consent_yes", "callback_consent_no", "callback_preference_acknowledged",
+                "thank_you", "affirmative", "ack", "unknown",
+            }:
+                return self._fixed(
+                    "goodbye",
+                    "Thank you for your time. Goodbye.",
+                    next_state="FOLLOWUP", clear_pending=True,
+                    callback_state=self.CLOSED,
+                    action="end_call",
+                    route="goodbye",
+                )
+
         if intent_id == "callback_consent_no" and state in {
             self.FOLLOWUP_OFFERED, self.AWAITING_DAY_TIME, self.AWAITING_DAY,
             self.AWAITING_TIME, self.PREFERENCE_RECORDED,
@@ -56,6 +72,7 @@ class CallbackCoordinator:
                 "callback_consent_no", "Understood. I won't record a callback preference.",
                 next_state="FOLLOWUP", clear_pending=True,
                 callback_state=self.IDLE, followup_consent="no",
+                slots_cleared=("callback_day", "callback_time", "callback_preference"),
             )
 
         # 3A: request_human
@@ -118,7 +135,9 @@ class CallbackCoordinator:
                 route="callback-preference",
             )
 
-        # 3C: callback confirmation when state is PREFERENCE_RECORDED
+        # A preference was already acknowledged when it was recorded. One
+        # brief acknowledgement may close that topic, but generic "okay" must
+        # not keep re-reading the preference forever.
         if state == self.PREFERENCE_RECORDED and intent_id in {
             "callback_consent_yes", "callback_preference_acknowledged", "thank_you",
         }:
@@ -128,14 +147,15 @@ class CallbackCoordinator:
                     "thank_you",
                     f"You're welcome! Our team will confirm availability for {preference}. Have a great day!",
                     next_state="FOLLOWUP", clear_pending=True,
-                    callback_state=self.PREFERENCE_RECORDED,
+                    callback_state=self.CLOSING,
                     route="callback-preference-acknowledged",
                 )
             return self._fixed(
                 "callback_preference_acknowledged",
-                f"Your requested follow-up time is {preference}. Our team will confirm availability.",
-                next_state="FOLLOWUP", clear_pending=True,
-                callback_state=self.PREFERENCE_RECORDED,
+                f"Great. We'll use {preference} as your preference. Is there anything else I can help with?",
+                next_state="FOLLOWUP",
+                pending=PendingQuestion("ask_anything_else", "conversation_continue", "boolean", turn_id),
+                callback_state=self.IDLE,
                 route="callback-preference-acknowledged",
             )
 
@@ -236,12 +256,15 @@ class CallbackCoordinator:
         intent_id: str, speech: str, *, next_state: str | None = None,
         pending: PendingQuestion | None = None, clear_pending: bool = False,
         route: str = "fixed",
+        action: str = "continue",
+        slots_cleared: tuple[str, ...] = (),
         **writes: Any,
     ) -> tuple[ResponsePlan, str]:
         return (
             ResponsePlan(
-                route, intent_id=intent_id, next_state=next_state,
+                route, action=action, intent_id=intent_id, next_state=next_state,
                 slots_written=writes, pending_question=pending,
+                slots_cleared=slots_cleared,
                 clear_pending_question=clear_pending, allow_speculative_audio=True,
                 booking_authority="preference", material_slots=tuple(sorted(writes)),
                 decision_reason="callback_state", decision_confidence=.99,

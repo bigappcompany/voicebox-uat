@@ -33,12 +33,11 @@ trailing final transcript replaces a provisional aggregate rather than creating
 a duplicate response. A transcription-only start is initially treated as
 untrusted, but meaningful subsequent STT text confirms it as a barge-in and
 flushes queued bot audio before the next answer starts.
-For low-risk, no-tool response plans, `ENABLE_SPEC_TTS=true` warms a second,
-private Cartesia WebSocket at call start. Interim LLM audio is retained locally
-until hard EOT validates the exact response fingerprint; then a capped PCM
-prefix is released before normal Cartesia synthesis continues. A mismatch,
-barge-in, high-risk plan, tool dependency, or failed private socket discards it
-and falls back to the normal public WebSocket stream.
+Production runs with `ENABLE_SPEC_TTS=false`. Stable/Eager interim transcripts
+may still start private LLM work, but only hard EOT can promote a matching
+candidate and every caller-facing response is synthesized through the one
+warmed public Cartesia WebSocket. This avoids private-PCM/public-stream splices
+and their miss penalties or audible gaps.
 
 Known greetings are stored persistently as Plivo-native 8 kHz μ-law under
 `.runtime-cache/greetings`. The first call for a new text/voice/version captures
@@ -64,10 +63,13 @@ first audio. No callback scheduling tool is connected, so callback times remain
 preferences rather than bookings.
 
 Latency summaries use nearest-rank percentiles, exclude error/retry routes,
-and measure detected EOT to transport audio start. Per-turn records include
-tenant, bundle version, state, route, WebSocket transport, speculative LLM/TTS,
-safe-text, PCM, and first-audio timestamps. They do not prove caller-perceived
-time until tested over representative calls.
+and measure speech-end to hard EOT, hard EOT to first safe text, first safe text
+to audible audio, and speech-end to audible audio per route. The operating
+targets are fixed-route p90 below 600 ms, hosted-route p90 below 900 ms, and no
+output gap above 350 ms. Per-turn records include tenant, bundle version,
+state, route, WebSocket transport, speculative LLM/TTS, safe-text, PCM, and
+first-audio timestamps. They do not prove caller-perceived time until tested
+over representative calls.
 
 V2 is an incremental, multi-tenant latency runtime. The original Plivo/Pipecat
 service has been copied here as the rollback-compatible media path; the new
@@ -146,6 +148,23 @@ non-secret source number from Goodbox. Direct mode supplies `PUBLIC_BASE_URL` as
 the outbound call's answer URL and does not modify the Plivo application. A
 real local call must increment both `plivo_callback_count` and
 `plivo_media_count` on `/health`.
+
+## Docker Compose
+
+Create a local `.env` containing the same service credentials and `PUBLIC_BASE_URL`
+used for a normal V2 run; it is injected at runtime and is never copied into the
+image. Ensure `PUBLIC_BASE_URL` is an externally reachable HTTPS URL that points
+to this service's port 8000 (for example, through a tunnel or reverse proxy).
+
+```bash
+docker compose up --build -d
+docker compose logs -f voice-agent-v2
+curl http://localhost:8000/health
+```
+
+Set `VOICEAGENT_PORT` before starting Compose to expose a different local port.
+Compose uses named volumes for logs and the greeting cache; remove them only if
+you intentionally want to clear persisted runtime artifacts.
 # Low-latency call validation
 
 The V2 Goodbox path uses dynamic Deepgram Flux profiles. The default fast

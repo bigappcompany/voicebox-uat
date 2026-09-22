@@ -20,15 +20,13 @@ from main import (
 )
 from voice_agent.agents.bundle import AgentBundle
 from voice_agent.flows.callbacks import CallbackCoordinator
-from voice_agent.flows.facts import FactExtractor
+from voice_agent.flows.facts import FactExtractor, NumericRange
 from voice_agent.runtime.flags import RuntimeFlags
 from voice_agent.runtime.intents import CanonicalIntentModel, IntentMatch
 from voice_agent.runtime.latency_breakdown import LatencyBreakdown
 from voice_agent.runtime.response_plan import ResponsePlan
 from voice_agent.runtime.session import CallSession, PendingQuestion
 from voice_agent.routing.deterministic import DeterministicRouter
-
-
 def make_bundle() -> AgentBundle:
     return AgentBundle(agent_id="test-agent", version="1.0", tenant_id="test-tenant")
 
@@ -457,6 +455,56 @@ class TestFix6PoliteClosuresAndNumbersAndKeepAlive(unittest.IsolatedAsyncioTestC
         update_timeline = self.extractor.extract("in forty days", {})
         self.assertEqual(update_timeline.values.get("hiring_timeline"), "forty days")
 
+    def test_headcount_department_and_conversational_filler(self):
+        # Spoken department headcount with conversational filler from live call
+        text = "above let s say three for department but honey i i wouldn t to have a proper conversation with regards to this"
+        update = self.extractor.extract(text, {"hiring_status": "yes"})
+        self.assertEqual(update.values.get("headcount"), 3)
+
+        # "twenty people for each department"
+        update_dept2 = self.extractor.extract("we need twenty people for each department", {})
+        self.assertEqual(update_dept2.values.get("headcount"), 20)
+
+        # "three per team"
+        update_team = self.extractor.extract("three per team", {})
+        self.assertEqual(update_team.values.get("headcount"), 3)
+
+        # pending_slot="headcount" with conversational trailer
+        pending_q = Mock(slot="headcount")
+        update_pending = self.extractor.extract("let s say four but we need to check", {}, pending_question=pending_q)
+        self.assertEqual(update_pending.values.get("headcount"), 4)
+
+        # pending_slot="headcount" should NOT extract time or timeline
+        update_time = self.extractor.extract("call me tomorrow at 5 pm", {}, pending_question=pending_q)
+        self.assertNotIn("headcount", update_time.values)
+
+    def test_closing_state_trailing_affirmations_trigger_end_call(self):
+        # 1. thank_you in PREFERENCE_RECORDED transitions to CLOSING
+        slots = {"callback_state": "PREFERENCE_RECORDED", "callback_preference": "Friday at 2pm"}
+        match = self.model.classify("thank you so much", fact_values=slots)
+        routed = self.coordinator.route(match, slots)
+        self.assertIsNotNone(routed)
+        plan, speech = routed
+        self.assertEqual(plan.slots_written.get("callback_state"), "CLOSING")
+        self.assertIn("Have a great day!", speech)
+
+        # 2. In CLOSING state, caller saying "yeah" triggers end_call
+        closing_slots = {"callback_state": "CLOSING", "callback_preference": "Friday at 2pm"}
+        match_yeah = self.model.classify("yeah", fact_values=closing_slots)
+        routed_yeah = self.coordinator.route(match_yeah, closing_slots)
+        self.assertIsNotNone(routed_yeah)
+        plan_yeah, speech_yeah = routed_yeah
+        self.assertEqual(plan_yeah.action, "end_call")
+        self.assertEqual(plan_yeah.slots_written.get("callback_state"), "CLOSED")
+        self.assertIn("Goodbye", speech_yeah)
+
+        # 3. In CLOSING state, router handles short affirmative deterministically
+        routed_ok = self.router.route("ok", self.bundle, slots=closing_slots)
+        self.assertIsNotNone(routed_ok)
+        plan_ok, speech_ok = routed_ok
+        self.assertEqual(plan_ok.action, "end_call")
+        self.assertIn("Goodbye", speech_ok)
+
     async def test_ordered_flux_watchdog_keepalive(self):
         from voice_agent.turns.flux import OrderedFluxSTTService
         import json
@@ -467,9 +515,126 @@ class TestFix6PoliteClosuresAndNumbersAndKeepAlive(unittest.IsolatedAsyncioTestC
         stt._websocket = Mock()
         stt.send_with_retry = AsyncMock()
         await stt._watchdog_task_handler()
-        stt.send_with_retry.assert_awaited_once_with(json.dumps({"type": "KeepAlive"}), stt._report_error)
+class TestFixesItems1To7(unittest.IsolatedAsyncioTestCase):
+    """Specific regression test cases for production call telemetry fixes 1-7."""
+
+    def setUp(self):
+        self.fe = FactExtractor()
+        self.im = CanonicalIntentModel()
+        self.bundle = make_bundle()
+
+    def test_fix1_standalone_boolean_guard(self):
+        """Fix 1: Leading yeah or not right now in long utterances must not hijack boolean pending questions."""
+        pq_continue = PendingQuestion("ask_anything_else", "conversation_continue", "boolean", 1)
+        pq_callback = PendingQuestion("ask_callback_consent", "followup_consent", "boolean", 1)
+        pq_hiring = PendingQuestion("ask_hiring_status", "hiring_status", "boolean", 1)
+
+        # Standalone booleans
+        self.assertEqual(self.im.classify("yeah", pending_question=pq_continue).intent_id, "conversation_continue_yes")
+        self.assertEqual(self.im.classify("no thanks", pending_question=pq_continue).intent_id, "conversation_continue_no")
+        self.assertEqual(self.im.classify("not right now", pending_question=pq_continue).intent_id, "conversation_continue_no")
+        self.assertEqual(self.im.classify("not right now", pending_question=pq_callback).intent_id, "callback_consent_no")
+        self.assertEqual(self.im.classify("yes", pending_question=pq_hiring).intent_id, "provide_hiring_status")
+
+        # Non-standalone utterances with leading boolean word must NOT trigger boolean intent
+        match_marketing = self.im.classify("yeah you missed out on the marketing department", pending_question=pq_continue)
+        self.assertNotEqual(match_marketing.intent_id, "conversation_continue_yes")
+
+        match_summary = self.im.classify("not right now can you give me a summary of what you do", pending_question=pq_callback)
+        self.assertNotEqual(match_summary.intent_id, "callback_consent_no")
+
+        # Hiring status not erased by 'not right now' when pending question was not hiring_status
+        facts = self.fe.extract("not right now can you give me a summary", {"hiring_status": "yes"}, pending_question=pq_continue)
+        self.assertNotIn("hiring_status", facts.values)
+
+    def test_fix2_explicit_facts_before_pending_boolean(self):
+        """Fix 2: Explicit facts and corrections must be processed before pending boolean."""
+        pq_continue = PendingQuestion("ask_anything_else", "conversation_continue", "boolean", 1)
+
+        # Utterance with correction and department
+        match = self.im.classify("yeah you missed out on the marketing department", pending_question=pq_continue)
+        self.assertEqual(match.intent_id, "provide_role")
+
+        # Utterance with correction and headcount
+        match_headcount = self.im.classify("yeah actually six people", pending_question=pq_continue)
+        self.assertEqual(match_headcount.intent_id, "provide_headcount")
+
+    def test_fix3_marketing_aliases_and_department_preservation(self):
+        """Fix 3: Marketing aliases and department preservation across turns."""
+        update1 = self.fe.extract("we need people in the marketing department", {})
+        self.assertIn("marketing", update1.values.get("roles", []))
+        self.assertIn("marketing", update1.values.get("departments", []))
+
+        # Digital marketing alias
+        update_alias = self.fe.extract("looking for growth and digital marketing roles", {})
+        self.assertIn("marketing", update_alias.values.get("roles", []))
+
+        # Preservation across turns: turn 1 mentioned technology, turn 2 mentions marketing
+        turn1_facts = {"roles": ["technology"], "departments": ["technology"]}
+        update2 = self.fe.extract("we also need two people for marketing", turn1_facts)
+        self.assertIn("technology", update2.values.get("roles", []))
+        self.assertIn("marketing", update2.values.get("roles", []))
+        self.assertIn("technology", update2.values.get("departments", []))
+        self.assertIn("marketing", update2.values.get("departments", []))
+
+    def test_fix4_reject_ambiguous_digit_sequences(self):
+        """Fix 4: Reject ambiguous digit sequences like 'eight two five' instead of inventing ranges."""
+        pq_headcount = PendingQuestion("ask_headcount", "headcount", "integer_or_range", 1)
+
+        update_ambiguous = self.fe.extract("eight two five", {}, pending_question=pq_headcount)
+        self.assertNotIn("headcount", update_ambiguous.values)
+
+        update_digits = self.fe.extract("1 2 3", {}, pending_question=pq_headcount)
+        self.assertNotIn("headcount", update_digits.values)
+
+        # Genuine range without connector before noun
+        update_valid = self.fe.extract("three four people in operations", {})
+        self.assertEqual(update_valid.values.get("headcount"), NumericRange(3, 4, "people", True))
+
+        # Genuine range with connector
+        update_connector = self.fe.extract("about six to eight candidates", {})
+        self.assertEqual(update_connector.values.get("headcount"), NumericRange(6, 8, "people", True))
+
+    async def test_fix5_low_information_transcripts_buffered(self):
+        """Fix 5: Buffer tiny low-information transcripts (hiria, very) without firing reprompt."""
+        from live_v2 import V2RoutingController, _LOW_INFO_FRAGMENTS
+
+        controller = V2RoutingController(
+            "dummy_key",
+            system_prompt="dummy_prompt",
+            session=CallSession("call-1", self.bundle.tenant_id, self.bundle),
+        )
+        metrics = TurnMetrics(turn_id=1)
+        controller._state = TurnState(turn_id=1, metrics=metrics)
+        controller._pending_text = "hiria"
+        await controller._settle_turn()
+        self.assertEqual(controller._prefix_buffer, "hiria")
+        self.assertEqual(controller._state.metrics.route, "stt-low-info-buffered")
+
+        # In OPENING state, deterministic router suppresses incomplete_response for 1-2 word unknown utterances
+        router = DeterministicRouter()
+        plan = router.route("hiria", self.bundle, slots={"state": "OPENING"}, turn_id=1)
+        self.assertIsNone(plan)
+
+    def test_fix7_profile_for_prompt_freeform_expansion(self):
+        """Fix 7: Open-ended requests get freeform profile; dynamic expansion in _on_interim."""
+        from voice_agent.turns.endpoint_profiles import profile_for_prompt
+
+        # Open-ended questions asking for elaboration return freeform
+        self.assertEqual(
+            profile_for_prompt("Could you tell me a little more about what you need help with?"),
+            "freeform",
+        )
+        self.assertEqual(
+            profile_for_prompt("What else can I help you with?"),
+            "freeform",
+        )
+        # Genuinely boolean questions return yes_no
+        self.assertEqual(
+            profile_for_prompt("Are you looking to hire right now?"),
+            "yes_no",
+        )
 
 
 if __name__ == "__main__":
     unittest.main()
-

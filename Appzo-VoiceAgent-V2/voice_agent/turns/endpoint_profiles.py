@@ -74,6 +74,13 @@ def profile_for_prompt(text: str) -> str:
     # the sentence also contains a polite auxiliary such as "could you".
     if re.search(r"\b(?:what|which)\s+(?:day|time|date|name)\b|\bwhen\b", value):
         return "short_entity"
+    # Open-ended questions asking for elaboration or explanation need freeform
+    if re.search(
+        r"\b(?:tell me (?:more|a little more)|what else|how can i|help you with|anything else|"
+        r"explain|describe|more about|share more)\b",
+        value,
+    ):
+        return "freeform"
     if re.search(
         r"\b(?:would|are|do|did|can|will|is|have)\s+you\b|"
         r"\b(?:is|does|will)\s+your\b|\bare\s+there\b|"
