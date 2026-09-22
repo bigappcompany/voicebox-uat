@@ -1,5 +1,5 @@
 agent_name = "voicebox-uat-v2"
-secret_set = "voicebox-uat-secret-v2"
+secret_set = "voicebox-uat-v2-secret"
 agent_profile = "agent-1x"
 region = "ap-south"
 max_session_duration = 900
