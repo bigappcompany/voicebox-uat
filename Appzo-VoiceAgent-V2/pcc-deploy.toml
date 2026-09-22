@@ -11,5 +11,5 @@ subdirectory = "Appzo-VoiceAgent-V2"
 dockerfile_path = "Dockerfile"
 
 [scaling]
-min_agents = 1
+min_agents = 0
 max_agents = 5
