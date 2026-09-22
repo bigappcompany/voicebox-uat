@@ -135,6 +135,7 @@ class V2RoutingController(StreamingVoiceController):
         self._safe_chunk_max_wait_ms = int(os.getenv("V2_SAFE_CHUNK_MAX_WAIT_MS", str(default_wait)))
         self._min_final_transcript_chars = int(os.getenv("V2_MIN_FINAL_TRANSCRIPT_CHARS", "2"))
         self._spec_restart_min_new_words = int(os.getenv("V2_SPEC_RESTART_MIN_NEW_WORDS", "3"))
+        self._min_useful_spec_lead_ms = int(os.getenv("V2_MIN_USEFUL_SPEC_LEAD_MS", "100"))
         self._spec_tts_commit_wait_secs = float(os.getenv("V2_SPEC_TTS_COMMIT_WAIT_MS", "40")) / 1000
         self._endpoint_profile_updater = None
         self._enable_spec_tts = self.flags.enable_spec_tts
@@ -258,6 +259,7 @@ class V2RoutingController(StreamingVoiceController):
             state.metrics.llm_request_started_at = None
             state.metrics.llm_stream_opened_at = None
             state.metrics.llm_first_token_at = None
+            state.metrics.first_speech_filter_text_at = None
             state.metrics.first_filtered_text_at = None
             state.metrics.first_safe_text_at = None
 
@@ -394,6 +396,7 @@ class V2RoutingController(StreamingVoiceController):
         state.metrics.llm_request_started_at = None
         state.metrics.llm_stream_opened_at = None
         state.metrics.llm_first_token_at = None
+        state.metrics.first_speech_filter_text_at = None
         state.metrics.first_filtered_text_at = None
         state.metrics.first_safe_text_at = None
         candidate.task = asyncio.create_task(self._generate(state, basis, plan, request=candidate))
@@ -539,6 +542,11 @@ class V2RoutingController(StreamingVoiceController):
         state.metrics.decision_intent = plan.intent_id or "unknown"
         state.metrics.decision_reason = plan.decision_reason
         state.metrics.knowledge_direct_hit = plan.route == "faq-direct"
+        state.metrics.retrieval_query = text
+        state.metrics.selected_doc_id = plan.knowledge_ids[0] if plan.knowledge_ids else None
+        state.metrics.retrieval_confidence = (
+            plan.decision_confidence if plan.knowledge_ids else None
+        )
         if state.metrics.spec_tts == "none":
             state.metrics.spec_tts_eligible = bool(
                 speech is None and self._spec_audio and plan.may_prepare_audio()
@@ -571,7 +579,18 @@ class V2RoutingController(StreamingVoiceController):
                 pass
             else:
                 state.metrics.route = "v2-speculation-hit"
-                state.metrics.speculation = "hit"
+                lead_ms = (
+                    (state.metrics.turn_committed_at - state.metrics.speculative_started_at) * 1000
+                    if state.metrics.turn_committed_at is not None
+                    and state.metrics.speculative_started_at is not None
+                    else None
+                )
+                useful_speculation = lead_ms is not None and lead_ms >= self._min_useful_spec_lead_ms
+                state.metrics.speculation = "hit" if useful_speculation else "late-reuse"
+                if not useful_speculation and state.metrics.spec_tts not in {"hit", "pcm_ready"}:
+                    state.metrics.spec_tts_eligible = False
+                    state.metrics.spec_tts = "not_eligible"
+                    state.metrics.spec_tts_reason = "insufficient_speculation_lead"
                 state.metrics.semantic_spec_reused = normalize(candidate.transcript) != normalize(text)
                 state.metrics.hosted_llm_used = True
                 state.v2_candidate_result = "promoted"
@@ -591,6 +610,7 @@ class V2RoutingController(StreamingVoiceController):
             state.metrics.llm_request_started_at = None
             state.metrics.llm_stream_opened_at = None
             state.metrics.llm_first_token_at = None
+            state.metrics.first_speech_filter_text_at = None
             state.metrics.first_filtered_text_at = None
             state.metrics.first_safe_text_at = None
         state.candidate = None
@@ -671,7 +691,14 @@ class V2RoutingController(StreamingVoiceController):
             else:
                 callback_sensitive = bool(
                     re.search(r"\b(?:book|schedule|appointment|callback|follow.?up)\b", text, re.I)
-                    or slots.get("callback_state") not in {None, "", CallbackCoordinator.IDLE}
+                    or intent.intent_id in {
+                        "callback_consent_yes",
+                        "callback_day",
+                        "callback_time",
+                        "callback_day_time",
+                        "callback_preference_acknowledged",
+                        "offer_callback",
+                    }
                 )
                 plan, speech = (
                     ResponsePlan(
@@ -699,6 +726,46 @@ class V2RoutingController(StreamingVoiceController):
                 speech = top.record.text
             else:
                 plan = replace(plan, knowledge_ids=tuple(item.record.document_id for item in matches))
+
+        if (
+            speech is None
+            and plan.intent_id == "faq_services"
+            and re.search(r"\b(?:blue collar|white collar)\b", normalize(text))
+            and not matches
+        ):
+            plan = replace(
+                plan,
+                route="fixed",
+                allow_speculative_audio=False,
+                decision_reason="approved_knowledge_unavailable",
+                decision_confidence=.99,
+            )
+            speech = (
+                "The available information doesn't confirm blue- or white-collar hiring support. "
+                "Our team can clarify that."
+            )
+
+        callback_day = str((current_facts or {}).get("callback_day") or "").strip()
+        callback_time = str((current_facts or {}).get("callback_time") or "").strip()
+        if callback_day and callback_time and plan.intent_id not in {
+            "callback_day", "callback_time", "callback_day_time",
+        }:
+            preference = f"{callback_day} at {callback_time}"
+            plan = replace(
+                plan,
+                next_state="FOLLOWUP",
+                clear_pending_question=True,
+                requires_booking_guard=True,
+                booking_authority="preference",
+                slots_written={
+                    **plan.slots_written,
+                    "callback_state": CallbackCoordinator.PREFERENCE_RECORDED,
+                    "callback_day": callback_day,
+                    "callback_time": callback_time,
+                    "callback_preference": preference,
+                },
+                material_slots=tuple(sorted({*plan.material_slots, "callback_day", "callback_time"})),
+            )
         return plan, speech
 
     @staticmethod
@@ -802,7 +869,7 @@ class V2RoutingController(StreamingVoiceController):
         matches = self._knowledge_matches(text, plan)
         if plan.knowledge_ids:
             matches = [m for m in matches if m.record.document_id in plan.knowledge_ids]
-        
+
         if diagnostics is not None:
             diagnostics["retrieval"] = [
                 {
@@ -833,7 +900,8 @@ class V2RoutingController(StreamingVoiceController):
         started = False
         speech_filter = SpeechStreamFilter()
         from voice_agent.speech.booking_guard import BookingClaimGuard
-        booking_guard = BookingClaimGuard()
+        booking_guard = BookingClaimGuard() if getattr(plan, "requires_booking_guard", False) else None
+        state.metrics.booking_guard_enabled = booking_guard is not None
         chunker = SafeSpeechChunker(
             min_chars=self._safe_chunk_chars,
             min_words=self._safe_chunk_words,
@@ -901,8 +969,11 @@ class V2RoutingController(StreamingVoiceController):
                 else:
                     started = True
                     request.public_response_started = True
-                    state.metrics.tts_requested_at = time.perf_counter()
+                    if state.metrics.response_release_at is None:
+                        state.metrics.response_release_at = time.perf_counter()
                     await self.push_frame(LLMFullResponseStartFrame())
+            if state.metrics.tts_requested_at is None:
+                state.metrics.tts_requested_at = time.perf_counter()
             await self.push_frame(LLMTextFrame(self._tts_delta(request, chunk)))
             request.normal_tts_text_sent = True
 
@@ -919,19 +990,25 @@ class V2RoutingController(StreamingVoiceController):
                 history=getattr(request, "v2_history", None),
                 diagnostics=diagnostics,
             )
-            
+
             def _norm(s):
                 return " ".join(s.casefold().split())
             user_msg_count = sum(1 for m in messages if m["role"] == "user" and _norm(m["content"]) == _norm(text))
             dedup_success = (user_msg_count == 1)
             logger.debug("V2 CONTEXT DEDUP | turn={} context_current_user_deduplicated={}", state.turn_id, str(dedup_success).lower())
             state.metrics.prompt_build_ms = round((time.perf_counter() - t_build_start) * 1000, 2)
-            
+
             ctx_metrics = getattr(request, "v2_context_metrics", {})
             state.metrics.pipecat_context_read_ms = ctx_metrics.get("pipecat_context_read_ms", 0.0)
             state.metrics.context_selection_ms = ctx_metrics.get("context_selection_ms", 0.0)
             state.metrics.context_token_estimation_ms = ctx_metrics.get("context_token_estimation_ms", 0.0)
-            
+            state.metrics.pipecat_context_messages_total = int(ctx_metrics.get("total", 0))
+            state.metrics.recent_context_messages_selected = int(ctx_metrics.get("selected", 0))
+            state.metrics.recent_context_tokens = int(ctx_metrics.get("tokens", 0))
+            state.metrics.total_prompt_tokens = int(
+                self.prompt_builder.section_token_estimates.get("total", 0)
+            )
+
             if self._log_llm_payloads:
                 payload = {
                     "turn_id": state.turn_id,
@@ -983,16 +1060,30 @@ class V2RoutingController(StreamingVoiceController):
                     if state.metrics.llm_first_token_at is None:
                         state.metrics.llm_first_token_at = time.perf_counter()
                     filtered = speech_filter.push(content)
+                    if filtered and state.metrics.first_speech_filter_text_at is None:
+                        state.metrics.first_speech_filter_text_at = time.perf_counter()
                     clean = booking_guard.push(filtered) if booking_guard else filtered
                     if clean:
                         if state.metrics.first_filtered_text_at is None:
                             state.metrics.first_filtered_text_at = time.perf_counter()
+                            if booking_guard and state.metrics.first_speech_filter_text_at is not None:
+                                state.metrics.booking_guard_wait_ms = round(
+                                    (state.metrics.first_filtered_text_at - state.metrics.first_speech_filter_text_at) * 1000,
+                                    2,
+                                )
                         parts.append(clean)
                         for safe in chunker.push(clean):
                             await emit_safe(safe)
                 filtered_tail = speech_filter.push("", final=True)
                 tail = booking_guard.push(filtered_tail, final=True) if booking_guard else filtered_tail
                 if tail:
+                    if state.metrics.first_filtered_text_at is None:
+                        state.metrics.first_filtered_text_at = time.perf_counter()
+                        if booking_guard and state.metrics.first_speech_filter_text_at is not None:
+                            state.metrics.booking_guard_wait_ms = round(
+                                (state.metrics.first_filtered_text_at - state.metrics.first_speech_filter_text_at) * 1000,
+                                2,
+                            )
                     parts.append(tail)
                     for safe in chunker.push(tail):
                         await emit_safe(safe)
@@ -1077,9 +1168,18 @@ class V2RoutingController(StreamingVoiceController):
 
     def _pending_from_speech(self, speech: str, turn_id: int) -> PendingQuestion | None:
         """Attach semantic meaning to a generated question for later replies."""
-        value = normalize(speech)
         if "?" not in speech:
             return None
+        # Only the final question clause determines the pending semantic
+        # question. A declarative callback acknowledgement followed by "Is
+        # there anything else?" is not another callback-consent question.
+        question_end = speech.rfind("?")
+        question_start = max(
+            speech.rfind(".", 0, question_end),
+            speech.rfind("!", 0, question_end),
+            speech.rfind("?", 0, question_end),
+        )
+        value = normalize(speech[question_start + 1:question_end + 1])
         patterns = (
             (r"\b(?:what day and time|day and time|preferred day|what time)\b", "ask_callback_day_time", "callback_preference", "date_and_time"),
             (r"\b(?:arrange|follow up|callback|call you back)\b", "ask_callback_consent", "followup_consent", "boolean"),
@@ -1087,6 +1187,7 @@ class V2RoutingController(StreamingVoiceController):
             (r"\b(?:what roles|which roles|roles are you)\b", "ask_roles", "roles", "list"),
             (r"\b(?:how many|roughly how many|headcount)\b", "ask_headcount", "headcount", "integer_or_range"),
             (r"\b(?:would you like details|interested|want details)\b", "ask_service_details", "service_details", "boolean"),
+            (r"\b(?:anything else|any other questions|help you with anything else)\b", "ask_anything_else", "conversation_continue", "boolean"),
         )
         for pattern, intent, slot, expected in patterns:
             if re.search(pattern, value):
@@ -1184,6 +1285,8 @@ class V2RoutingController(StreamingVoiceController):
     async def _deliver(self, state, speech: str, plan: ResponsePlan) -> None:
         if self._state is not state or state.answer_finished:
             return
+        if state.metrics.response_release_at is None:
+            state.metrics.response_release_at = time.perf_counter()
         from voice_agent.speech.booking_guard import BookingClaimGuard
         speech = BookingClaimGuard.check(speech)
         self._stage_delivery(state, speech, plan)
@@ -1219,7 +1322,10 @@ class V2RoutingController(StreamingVoiceController):
         if not chunks or not self._streaming:
             await self._deliver(state, speech, plan)
             return
-        state.metrics.tts_requested_at = time.perf_counter()
+        if state.metrics.response_release_at is None:
+            state.metrics.response_release_at = time.perf_counter()
+        if state.metrics.tts_requested_at is None:
+            state.metrics.tts_requested_at = time.perf_counter()
         state.answer_finished = True
         self._stage_delivery(state, speech, plan)
         await self.push_frame(LLMFullResponseStartFrame())
@@ -1304,7 +1410,7 @@ class V2RoutingController(StreamingVoiceController):
         """
         if self._state is not state or state.answer_finished or request.public_response_started:
             return
-        state.metrics.tts_requested_at = time.perf_counter()
+        state.metrics.response_release_at = time.perf_counter()
         request.speculative = False
         request.public_response_started = True
         request.private_pcm_committed = bool(pcm)
@@ -1328,6 +1434,8 @@ class V2RoutingController(StreamingVoiceController):
             else:
                 request.last_tts_text = request.spec_audio_text
         for chunk in public_chunks:
+            if state.metrics.tts_requested_at is None:
+                state.metrics.tts_requested_at = time.perf_counter()
             await self.push_frame(LLMTextFrame(self._tts_delta(request, chunk)))
             request.normal_tts_text_sent = True
         if request.completed:

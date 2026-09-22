@@ -10,7 +10,12 @@ class BookingClaimGuard:
         self.pending += text
         out = []
         while True:
-            match = re.search(r"[.!?](?:\s|$)", self.pending)
+            # The runtime explicitly prompts the model to begin with a short,
+            # independently speakable clause. Inspect and release those
+            # clauses instead of buffering an entire long sentence. Booking
+            # claims such as "I will arrange," are still caught in that first
+            # clause before any text reaches TTS.
+            match = re.search(r"[,;:.!?](?:\s|$)", self.pending)
             if not match:
                 break
             sentence, self.pending = self.pending[:match.end()], self.pending[match.end():]

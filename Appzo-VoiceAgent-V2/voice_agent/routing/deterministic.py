@@ -47,10 +47,13 @@ class DeterministicRouter:
             return None
 
         fixed = {
+            "thank_you": ("thank_you", "You're welcome! Is there anything else I can help you with?", "continue"),
             "repeat": ("repeat", "Could you tell me which part you would like repeated?", "continue"),
             "wrong_person": ("wrong-person", "I apologize for the inconvenience. Goodbye.", "end_call"),
             "not_interested": ("not-interested", "Understood. Thank you for your time. Goodbye.", "end_call"),
             "model_identity": ("model-identity", "I'm an AI voice assistant for this hiring call.", "continue"),
+            "conversation_continue_yes": ("continue", "Sure. What else can I help you with?", "continue"),
+            "conversation_continue_no": ("goodbye", "Thank you for your time. Goodbye.", "end_call"),
         }
         if intent_id in fixed:
             key, fallback, action = fixed[intent_id]
@@ -83,6 +86,99 @@ class DeterministicRouter:
                 "fixed", intent_id, agent.cached_utterances.get(key, fallback),
                 next_state=self._state_for_slot(pending_question.slot),
                 pending=pending_question, match=match,
+            )
+
+        if intent_id == "unknown" and len(normalize_intent_text(text).split()) <= 2:
+            if str(slots.get("callback_state") or "") == "PREFERENCE_RECORDED":
+                pref = str(slots.get("callback_preference") or "your requested time")
+                return self._plan(
+                    "fixed", "callback_preference_acknowledged",
+                    f"Your requested follow-up time is {pref}. Our team will confirm availability.",
+                    next_state="FOLLOWUP",
+                    writes={"callback_state": "PREFERENCE_RECORDED"},
+                    match=match,
+                )
+            return self._plan(
+                "fixed", "incomplete_response",
+                "Could you tell me a little more about what you need help with?",
+                match=match,
+            )
+
+        if intent_id == "request_human":
+            pref = str(slots.get("callback_preference") or "")
+            if pref:
+                return self._plan(
+                    "fixed",
+                    "request_human",
+                    f"Sure. I have {pref} as your preferred follow-up time. Our team will confirm availability.",
+                    next_state="FOLLOWUP",
+                    writes={"callback_state": "PREFERENCE_RECORDED"},
+                    match=match,
+                )
+            return self._plan(
+                "fixed",
+                "request_human",
+                "Sure. What day and time would be convenient?",
+                next_state="CALLBACK",
+                pending=PendingQuestion("ask_callback_day_time", "callback_preference", "date_and_time", turn_id),
+                writes={"callback_state": "AWAITING_DAY_TIME", "followup_consent": "yes"},
+                match=match,
+            )
+
+        if intent_id == "busy":
+            pref = str(slots.get("callback_preference") or "")
+            if pref:
+                return self._plan(
+                    "fixed",
+                    "busy",
+                    f"Of course. I have {pref} as your preferred follow-up time. Our team will confirm availability.",
+                    next_state="FOLLOWUP",
+                    writes={"callback_state": "PREFERENCE_RECORDED"},
+                    match=match,
+                )
+            return self._plan(
+                "fixed",
+                "busy",
+                "Of course. What day and time would work better?",
+                next_state="CALLBACK",
+                pending=PendingQuestion("ask_callback_day_time", "callback_preference", "date_and_time", turn_id),
+                writes={"callback_state": "AWAITING_DAY_TIME", "followup_consent": "yes"},
+                match=match,
+            )
+
+        if intent_id == "recall_callback_preference":
+            pref = str(slots.get("callback_preference") or "")
+            if pref:
+                return self._plan(
+                    "fixed",
+                    "recall_callback_preference",
+                    f"You mentioned {pref} as your preferred time. Our team will confirm availability.",
+                    next_state="FOLLOWUP",
+                    writes={"callback_state": "PREFERENCE_RECORDED"},
+                    match=match,
+                )
+            return self._plan(
+                "fixed",
+                "recall_callback_preference",
+                "What day and time would be convenient for a callback?",
+                next_state="CALLBACK",
+                pending=PendingQuestion("ask_callback_day_time", "callback_preference", "date_and_time", turn_id),
+                writes={"callback_state": "AWAITING_DAY_TIME", "followup_consent": "yes"},
+                match=match,
+            )
+
+        if (
+            str(slots.get("callback_state") or "") == "PREFERENCE_RECORDED"
+            and intent_id in {"callback_consent_yes", "callback_preference_acknowledged"}
+        ):
+            pref = str(slots.get("callback_preference") or "your requested time")
+            return self._plan(
+                "fixed",
+                "callback_preference_acknowledged",
+                f"Your requested follow-up time is {pref}. Our team will confirm availability.",
+                next_state="FOLLOWUP",
+                writes={"callback_state": "PREFERENCE_RECORDED"},
+                match=match,
             )
 
         if str(slots.get("callback_state") or "IDLE") not in (None, "", "IDLE") or (pending_question and pending_question.slot.startswith("callback_")):

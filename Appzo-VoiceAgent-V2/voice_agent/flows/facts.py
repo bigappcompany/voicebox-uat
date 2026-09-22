@@ -7,18 +7,32 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-_NUMBER_WORDS = {
-    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
-    "eleven": 11, "twelve": 12, "fifteen": 15, "twenty": 20,
+_TENS = {
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
 }
+_ONES = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+    "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+    "nineteen": 19,
+}
+_NUMBER_WORDS = {**_ONES, **_TENS, "hundred": 100}
 
 
 def _number(value: str) -> int | None:
-    value = value.casefold().strip()
+    value = value.casefold().strip().replace("-", " ")
     if value.isdigit():
         return int(value)
-    return _NUMBER_WORDS.get(value)
+    if value in _NUMBER_WORDS:
+        return _NUMBER_WORDS[value]
+    parts = value.split()
+    if len(parts) == 2 and parts[0] in _TENS and parts[1] in _ONES:
+        return _TENS[parts[0]] + _ONES[parts[1]]
+    if len(parts) == 2 and parts[0] in _ONES and parts[1] == "hundred":
+        return _ONES[parts[0]] * 100
+    return None
 
 
 @dataclass(frozen=True)
@@ -61,7 +75,23 @@ class FactUpdate:
 class FactExtractor:
     """Extract conservative facts without adding a sequential model request."""
 
-    _number_pattern = r"(?:\d{1,3}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty)"
+    _number_pattern = (
+        r"(?:\d{1,3}|"
+        r"(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)(?:[\s-](?:one|two|three|four|five|six|seven|eight|nine))?|"
+        r"one|two|three|four|five|six|seven|eight|nine|ten|"
+        r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|"
+        r"hundred)"
+    )
+    _callback_day = re.compile(
+        r"\b(today|tomorrow|(?:the\s+)?day after tomorrow|later today|next week|"
+        r"(?:this|next)?\s*(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b"
+    )
+    _callback_time = re.compile(
+        r"\b((?:around\s+)?(?:at\s+)?(?:[01]?\d|2[0-3])(?::[0-5]\d)?\s*(?:a\s*m|p\s*m)|"
+        r"(?:around\s+)?(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
+        r"(?:\s+(?:[0-5][0-9]))?\s*(?:a\s*m|p\s*m)|half past\s+"
+        r"(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve))\b"
+    )
 
     def __init__(self, profile: dict[str, Any] | None = None, *, default_profile: str = "") -> None:
         self.profile = dict(profile or {})
@@ -81,6 +111,26 @@ class FactExtractor:
         updates: dict[str, Any] = {}
         approximate_fields: set[str] = set()
         pending_slot = str(getattr(pending_question, "slot", "") or "")
+
+        # Callback facts are independent of the primary intent. A caller can
+        # provide a preferred time and ask an FAQ in the same utterance.
+        callback_context = bool(
+            pending_slot.startswith("callback_")
+            or pending_slot == "callback_preference"
+            or str(current.get("callback_state") or "IDLE") != "IDLE"
+            or re.search(r"\b(?:callback|call back|follow up|meeting)\b", normalized)
+        )
+        if callback_context:
+            days = list(self._callback_day.finditer(normalized))
+            times = list(self._callback_time.finditer(normalized))
+            if days:
+                updates["callback_day"] = days[-1].group(1).strip()
+            if times:
+                updates["callback_time"] = times[-1].group(1).strip()
+            day_value = updates.get("callback_day") or current.get("callback_day")
+            time_value = updates.get("callback_time") or current.get("callback_time")
+            if day_value and time_value:
+                updates["callback_preference"] = f"{day_value} at {time_value}"
 
         if re.search(r"\b(?:not hiring|no hiring|aren't hiring|are not hiring|not right now|not now)\b", normalized):
             updates["hiring_status"] = "no"
@@ -122,7 +172,7 @@ class FactExtractor:
         headcount = re.search(
             rf"\b(?:need|hire|hiring|require|about|around|roughly|approximately|lets say|let s say)?\s*"
             rf"({self._number_pattern})(?:\s*(?:to|-|or)?\s*({self._number_pattern}))?\s+"
-            r"(?:people|persons|employees|hires|candidates|positions|members|roles)\b",
+            r"(?:people|persons|employees|hires|candidates|positions|members|roles|staff|engineers|developers)\b",
             normalized,
         )
         if not headcount and current.get("headcount") not in (None, ""):
@@ -153,7 +203,7 @@ class FactExtractor:
 
         aliases = self.profile.get("role_aliases") or {
             "operations": ["operations", "operation", "ops", "operation check", "operations check"],
-            "technology": ["technology", "tech", "engineering", "engineers", "developers", "developer", "it"],
+            "technology": ["technology", "tech", "engineering", "engineers", "developers", "developer"],
             "sales": ["sales"],
             "human resources": ["human resources", "hr"],
             "finance": ["finance", "accounting"],
@@ -162,8 +212,35 @@ class FactExtractor:
         if isinstance(aliases, dict):
             for canonical, phrases in aliases.items():
                 values = [phrases] if isinstance(phrases, str) else list(phrases or [])
+                values = [v for v in values if str(v).casefold() not in {"it", "i.t."}]
                 if any(re.search(rf"\b{re.escape(str(value).casefold())}\b", normalized) for value in values):
                     found.append(str(canonical))
+
+        it_matched = False
+        if re.search(
+            r"\b(?:information technology|it\s+(?:department|team|roles?|jobs?|positions?|functions?|staff|support|personnel|professionals?|openings?)|tech\s+roles?)\b",
+            normalized,
+        ):
+            it_matched = True
+        elif pending_slot in {"roles", "departments"} and (
+            normalized in {"it", "i t"}
+            or re.fullmatch(r"(?:for\s+)?(?:it|i t)", normalized)
+        ):
+            it_matched = True
+        elif re.search(r"\bIT\b", text):
+            pronoun_usage = bool(
+                re.search(
+                    r"\b(?:confirm|leave|forget|do|schedule|that['’]?s|thats|drop|skip|cancel|got|take|make|send|hear|see|keep|get)\s+IT\b",
+                    text,
+                    re.I,
+                )
+                or re.search(r"\bIT\s+(?:is|was|will|can|could|would|should|has|had)\b", text)
+            )
+            if not pronoun_usage:
+                it_matched = True
+
+        if it_matched and "technology" not in found:
+            found.append("technology")
         if found:
             updates["roles"] = sorted(set(found))
             if current.get("hiring_status") in (None, "") and "hiring_status" not in updates:

@@ -9,8 +9,10 @@ class TurnMetrics:
     first_interim_at: float | None = None; stable_semantic_prefix_at: float | None = None; soft_eot_at: float | None = None
     final_stt_at: float | None = None; hard_eot_at: float | None = None; route_started_at: float | None = None; route_completed_at: float | None = None
     retrieval_started_at: float | None = None; retrieval_completed_at: float | None = None; llm_requested_at: float | None = None
-    llm_first_token_at: float | None = None; first_safe_text_at: float | None = None; spec_tts_started_at: float | None = None
+    llm_first_token_at: float | None = None; first_speech_filter_text_at: float | None = None; first_filtered_text_at: float | None = None
+    first_safe_text_at: float | None = None; spec_tts_started_at: float | None = None
     spec_tts_first_audio_at: float | None = None; commit_at: float | None = None; first_output_frame_at: float | None = None; bot_started_at: float | None = None
+    response_release_at: float | None = None; booking_guard_enabled: bool = False; booking_guard_wait_ms: float = 0.0; tts_requested_at: float | None = None
     route: str = ""; model: str = ""; spec_llm: str = "none"; spec_tts: str = "none"; endpoint_mode: str = ""
 
     def mark(self, name: str) -> None:

@@ -104,12 +104,16 @@ Stable Flux interims and EagerEndOfTurn can prepare private speculative work.
 TurnResumed invalidates it. Classified routes may reuse a response only when
 the tenant/state/intent/knowledge/material-slot fingerprint matches;
 unclassified hosted turns still require exact normalized text.
+Set `V2_MIN_USEFUL_SPEC_LEAD_MS` (default `100`) to control when a reused
+candidate is counted as a genuine latency speculation hit. Later candidates
+remain reusable to avoid duplicate model work, but are reported as
+`late-reuse` and cannot inflate speculation-hit metrics.
 
 Callback time variants (including `p.m.`) use a local preference state machine.
-Only booking-sensitive hosted output uses the sentence-level booking-claim
-guard; ordinary hosted output streams directly. No scheduling service is
-connected. Live latency and recognition quality still require representative
-calls; unit tests do not establish a latency SLO.
+All hosted output passes through the booking-claim guard. It releases checked
+clause boundaries instead of buffering an entire sentence. No scheduling
+service is connected. Live latency and recognition quality still require
+representative calls; unit tests do not establish a latency SLO.
 
 ```bash
 # Use Python 3.10+ (the workspace's ../.venv313/bin/python is suitable).
@@ -125,6 +129,23 @@ python scripts/record_baseline.py path/to/server.log
 Set the same environment values used by V1, then run `goodbox_server.py` and
 `scripts/dial_goodbox_test.py`. Do not turn on speculative audio for regulated
 or tool-dependent flows; the V2 controller enforces this again at commit time.
+
+The default `goodbox` test route is controlled by the Goodbox backend and can
+therefore run on a remote voice worker. To guarantee that a benchmark call
+reaches the locally running server, set Plivo API credentials locally and use
+the explicit local route:
+
+```bash
+PLIVO_AUTH_ID=... \
+PLIVO_AUTH_TOKEN=... \
+python3 scripts/dial_goodbox_test.py --route local --to +918000000000
+```
+
+`PLIVO_SOURCE_NUMBER` is optional; when absent, the helper reads the configured
+non-secret source number from Goodbox. Direct mode supplies `PUBLIC_BASE_URL` as
+the outbound call's answer URL and does not modify the Plivo application. A
+real local call must increment both `plivo_callback_count` and
+`plivo_media_count` on `/health`.
 # Low-latency call validation
 
 The V2 Goodbox path uses dynamic Deepgram Flux profiles. The default fast

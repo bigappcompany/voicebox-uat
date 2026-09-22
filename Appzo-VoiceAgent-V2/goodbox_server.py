@@ -5,6 +5,7 @@ prompt, behavior, and service settings. This service only handles the media
 webhook that Goodbox's Plivo number reaches after a call is placed.
 """
 
+import asyncio
 import base64
 import hashlib
 import os
@@ -248,6 +249,21 @@ class GoodboxApi:
         data = body.get("data") if isinstance(body, dict) else None
         if not isinstance(data, dict):
             raise ValueError("Goodbox CALL_START returned no configuration data")
+        logger.info(
+            "GOODBOX CALL START | status={} call_id={} stream_id={} voice_call_id={} chatbot_id={}",
+            response.status_code,
+            call_data.get("call_id"),
+            call_data.get("stream_id"),
+            data.get("voice_call_id"),
+            call_data.get("chatbot_id"),
+        )
+        if not data.get("voice_call_id"):
+            logger.warning(
+                "GOODBOX CALL START MISSING ID | call_id={} stream_id={} chatbot_id={}",
+                call_data.get("call_id"),
+                call_data.get("stream_id"),
+                call_data.get("chatbot_id"),
+            )
         return data
 
     async def call_stop(
@@ -259,8 +275,25 @@ class GoodboxApi:
             "messages": messages,
             "inbox_key": os.getenv("GOODBOX_INBOX_KEY", "voice_standard_inbox"),
         }
+        logger.info(
+            "GOODBOX CALL STOP BEGIN | stream_id={} voice_call_id={} messages={}",
+            stream_id, voice_call_id, len(messages),
+        )
         response = await self._client.post(f"{self._base_url}{CALL_STOP_PATH}", json=payload)
         response.raise_for_status()
+        role_counts = {
+            role: sum(1 for item in messages if item.get("role") == role)
+            for role in ("user", "assistant")
+        }
+        logger.info(
+            "GOODBOX CALL STOP | status={} stream_id={} voice_call_id={} messages={} user_messages={} assistant_messages={}",
+            response.status_code,
+            stream_id,
+            voice_call_id,
+            len(messages),
+            role_counts["user"],
+            role_counts["assistant"],
+        )
 
 
 @dataclass
@@ -315,6 +348,7 @@ async def plivo_callback(
     CallUUID: str | None = Form(None),
     From: str | None = Form(None),
     To: str | None = Form(None),
+    chatbot_id: str | None = Query(None),
 ) -> Response:
     app.state.callback_count = getattr(app.state, "callback_count", 0) + 1
     logger.info("PLIVO CALLBACK | call_id={} phone_id={}", CallUUID, phone_id)
@@ -325,6 +359,7 @@ async def plivo_callback(
         "from": From,
         "to": To,
         "provider": "plivo",
+        "chatbot_id": chatbot_id,
     }
     import json
 
@@ -398,8 +433,18 @@ async def plivo_media(websocket: WebSocket, body: str = Query("")) -> None:
             finally:
                 # Goodbox receives all completed user/assistant turns even when
                 # the carrier disconnects or the pipeline exits with an error.
-                await goodbox.call_stop(
-                    transcript.stream_id, transcript.voice_call_id, transcript.messages
+                # Carrier disconnect cancellation must not discard the only
+                # transcript persistence request. Keep it bounded so shutdown
+                # cannot hang indefinitely.
+                await asyncio.wait_for(
+                    asyncio.shield(
+                        goodbox.call_stop(
+                            transcript.stream_id,
+                            transcript.voice_call_id,
+                            transcript.messages,
+                        )
+                    ),
+                    timeout=15,
                 )
         finally:
             await goodbox.close()

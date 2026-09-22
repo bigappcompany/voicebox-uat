@@ -131,4 +131,7 @@ class ConversationContextAdapter:
             current_user_text=current_user_text,
             dialogue_version=dialogue_version,
             estimated_tokens=tokens,
+            pipecat_read_ms=round((t1 - t0) * 1000, 3),
+            selection_ms=round((t3 - t2) * 1000, 3),
+            token_estimation_ms=round(token_estimation_time * 1000, 3),
         )

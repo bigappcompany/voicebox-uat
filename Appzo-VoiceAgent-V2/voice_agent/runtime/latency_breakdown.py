@@ -122,22 +122,61 @@ class LatencyBreakdown:
         response_owner_kind = "service" if hosted else "bot"
         response_owner = model if hosted else route
         safe_text = metrics.first_safe_text_at
+        if hosted:
+            add_until(
+                metrics.llm_first_token_at,
+                "llm.first_token",
+                "LLM request to first token",
+                "service",
+                model,
+            )
+            add_until(
+                getattr(metrics, "first_speech_filter_text_at", None),
+                "response.speech_filter",
+                "first token to speech filter",
+                "pipeline",
+                "speech stream filter",
+            )
+            add_until(
+                metrics.first_filtered_text_at,
+                "response.booking_guard",
+                "booking-claim guard",
+                "pipeline",
+                "booking guard",
+            )
         if safe_text is not None and safe_text > cursor:
             add_until(
                 safe_text,
                 "response.first_safe_text",
-                "LLM + safe-text readiness" if hosted else "response readiness",
+                "safe speech chunk readiness" if hosted else "response readiness",
+                "pipeline" if hosted else response_owner_kind,
+                "safe speech chunker" if hosted else response_owner,
+            )
+
+        release_at = getattr(metrics, "response_release_at", None)
+        if release_at is not None and metrics.tts_requested_at is not None and release_at < metrics.tts_requested_at:
+            add_until(
+                release_at,
+                "response.release",
+                "response routing/release",
                 response_owner_kind,
                 response_owner,
             )
-
-        add_until(
-            metrics.tts_requested_at,
-            "response.release_to_tts",
-            "response routing/release",
-            response_owner_kind,
-            response_owner,
-        )
+            add_until(
+                metrics.tts_requested_at,
+                "response.release_to_tts",
+                "TTS dispatch",
+                "pipeline",
+                "speech chunk dispatch",
+            )
+        else:
+            add_until(
+                release_at or metrics.tts_requested_at,
+                "response.release_to_tts",
+                "response routing/release",
+                response_owner_kind,
+                response_owner,
+            )
         add_until(
             metrics.tts_first_audio_at,
             "tts.first_audio",

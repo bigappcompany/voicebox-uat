@@ -11,9 +11,11 @@ CANONICAL_INTENTS = frozenset({
     "greeting", "provide_hiring_status", "provide_role", "provide_headcount",
     "provide_timeline", "faq_services", "faq_pricing", "existing_agency",
     "request_human", "callback_consent_yes", "callback_consent_no",
+    "conversation_continue_yes", "conversation_continue_no",
     "callback_day", "callback_time", "callback_day_time", "repeat",
     "correction", "out_of_scope", "model_identity", "wrong_person", "busy",
-    "not_interested", "goodbye", "company_identity", "incomplete_response", "unknown",
+    "not_interested", "goodbye", "thank_you", "company_identity", "incomplete_response", "unknown",
+    "recall_callback_preference", "callback_preference_acknowledged",
 })
 
 
@@ -39,6 +41,11 @@ class CanonicalIntentModel:
     _yes = frozenset({
         "yes", "yep", "yup", "yeah", "sure", "okay", "ok", "please do",
         "sounds good", "that works", "go ahead", "fine", "correct", "yes please",
+        "that's correct", "thats correct", "that s correct",
+        "confirm it",
+        "that's right", "thats right", "that s right",
+        "okay that's fine", "okay thats fine", "okay that s fine",
+        "that is correct", "that is right",
     })
     _no = frozenset({
         "no", "nope", "no thanks", "not now", "dont", "do not", "please dont",
@@ -59,9 +66,11 @@ class CanonicalIntentModel:
         # A more robust boolean parser for phrases like "that is true yeah"
         # or negations like "yeah no dont do that"
         val = value.casefold()
+        if re.search(r"\b(?:not sure|not certain|dont know|do not know|unsure|maybe|perhaps)\b", val):
+            return "ambiguous"
         if re.search(r"\b(?:no|nope|not|dont|do not)\b", val):
             return "no"
-        if re.search(r"\b(?:yes|yep|yup|yeah|sure|okay|ok|correct|true|go ahead|fine)\b", val):
+        if re.search(r"\b(?:yes|yep|yup|yeah|sure|okay|ok|correct|true|go ahead|fine|sounds good|confirm it|that\s*'?\s*s\s+right|that\s*'?\s*s\s+correct|okay\s+that\s*'?\s*s\s+fine|that\s+is\s+right|that\s+is\s+correct)\b", val):
             return "yes"
         return "ambiguous"
 
@@ -81,22 +90,36 @@ class CanonicalIntentModel:
             current_facts = FactExtractor().extract(text, {}).values
         pending_intent = str(getattr(pending_question, "intent", "") or "")
         pending_slot = str(getattr(pending_question, "slot", "") or "")
+        pending_type = str(getattr(pending_question, "expected_type", "") or "")
 
         configured = self._configured(value, configured_patterns or {})
         if configured is not None:
             return configured
 
-        if value in {"bye", "goodbye", "end call", "hang up", "stop calling"}:
-            return IntentMatch("goodbye", .995, "exact_phrase")
+        if (
+            re.search(
+                r"\b(?:goodbye|bye|bye\s+bye|have\s+a\s+(?:good|great)\s+day|end\s+call|hang\s+up|stop\s+calling)\b",
+                value,
+            )
+            and not re.search(r"\b(?:dont|do not|please dont)\b", value)
+        ):
+            return IntentMatch("goodbye", .995, "goodbye_phrase")
         if value in {"hello", "hi", "hey", "namaste"}:
             return IntentMatch("greeting", .99, "exact_phrase")
         if re.search(r"\b(?:wrong person|wrong number|wrong contact)\b", value):
             return IntentMatch("wrong_person", .99, "safety_phrase")
         if re.search(r"\b(?:not interested|dont call me|do not call me|remove my number)\b", value):
             return IntentMatch("not_interested", .99, "safety_phrase")
-        if re.search(r"\b(?:speak|talk|connect).*(?:human|person|manager|someone)\b", value):
+        if re.search(
+            r"\b(?:i\s+already\s+told\s+you|i\s+told\s+you\s+already|same\s+time\s+as\s+(?:earlier|before)|"
+            r"what\s+time\s+did\s+i\s+(?:give|tell)\s+you|what\s+time\s+did\s+i\s+say|"
+            r"as\s+i\s+mentioned\s+before|as\s+mentioned\s+earlier)\b",
+            value,
+        ):
+            return IntentMatch("recall_callback_preference", .98, "recall_phrase")
+        if re.search(r"\b(?:speak|talk|connect).*(?:human|person|manager|someone)|\brequest.*human|talk to human|speak to human\b", value):
             return IntentMatch("request_human", .97, "handoff_phrase")
-        if re.search(r"\b(?:im busy|i am busy|call.*later|talk.*later|middle of something)\b", value):
+        if re.search(r"\b(?:busy|im busy|i am busy|call.*later|talk.*later|middle of something|not a good time|busy right now|can we talk later|can you call later)\b", value):
             return IntentMatch("busy", .94, "defer_phrase")
         if re.search(r"\b(?:repeat|say that again|come again|what did you say)\b", value):
             return IntentMatch("repeat", .98, "repeat_phrase")
@@ -117,6 +140,15 @@ class CanonicalIntentModel:
             return IntentMatch("existing_agency", .9, "agency_phrase")
         if re.search(r"\b(?:what (?:kind of|type of)?\s*(?:preference|callback|option)|clarify|what do you mean)\b", value):
             return IntentMatch("clarification", .95, "clarification_phrase")
+        if (
+            re.search(
+                r"\b(?:thank\s+you|thanks|thank\s+you\s+so\s+much|thanks\s+a\s+lot|thank\s+you\s+very\s+much|"
+                r"many\s+thanks|appreciate\s+it|thank\s+you\s+for\s+(?:your\s+)?(?:help|time))\b",
+                value,
+            )
+            and not re.search(r"\b(?:no|not)\b", value)
+        ):
+            return IntentMatch("thank_you", .98, "gratitude_phrase")
 
         day_matches = list(self._days.finditer(value))
         clock_matches = list(self._times.finditer(value))
@@ -141,6 +173,19 @@ class CanonicalIntentModel:
                 return IntentMatch("callback_time", .95, "time_phrase", {"callback_time": clock.group(1).strip()})
 
         bool_val = self._parse_boolean(value)
+        if facts.get("callback_state") == "PREFERENCE_RECORDED" or (
+            facts.get("callback_preference") and not pending_question
+        ):
+            if bool_val == "yes" or value in self._yes or re.search(
+                r"\b(?:confirm(?:\s+it)?|sounds\s+good|that\s*'?\s*s\s+(?:correct|right|fine)|okay\s+that\s*'?\s*s\s+fine|correct|yes|yeah|yep|sure|fine)\b",
+                value,
+            ):
+                return IntentMatch("callback_consent_yes", .995, "callback_confirmation")
+        if pending_type == "boolean" and pending_slot == "conversation_continue":
+            if bool_val == "yes":
+                return IntentMatch("conversation_continue_yes", .995, "pending_question")
+            if bool_val == "no":
+                return IntentMatch("conversation_continue_no", .995, "pending_question")
         if pending_intent in {"offer_callback", "ask_callback_consent"} or pending_slot in {"followup_consent", "callback_consent"}:
             if bool_val == "yes":
                 return IntentMatch("callback_consent_yes", .995, "pending_question")

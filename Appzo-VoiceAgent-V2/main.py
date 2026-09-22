@@ -133,6 +133,7 @@ class TurnMetrics:
     llm_request_started_at: float | None = None
     llm_stream_opened_at: float | None = None
     llm_first_token_at: float | None = None
+    first_speech_filter_text_at: float | None = None
     first_filtered_text_at: float | None = None
     first_safe_text_at: float | None = None
     spec_tts_started_at: float | None = None
@@ -144,6 +145,9 @@ class TurnMetrics:
     candidate_validated_at: float | None = None
     candidate_promoted_at: float | None = None
     protocol_validated_at: float | None = None
+    response_release_at: float | None = None
+    booking_guard_enabled: bool = False
+    booking_guard_wait_ms: float = 0.0
     tts_requested_at: float | None = None
     tts_first_audio_at: float | None = None
     tts_first_non_silent_at: float | None = None
@@ -171,6 +175,13 @@ class TurnMetrics:
     context_selection_ms: float = 0.0
     context_token_estimation_ms: float = 0.0
     prompt_build_ms: float = 0.0
+    pipecat_context_messages_total: int = 0
+    recent_context_messages_selected: int = 0
+    recent_context_tokens: int = 0
+    total_prompt_tokens: int = 0
+    retrieval_query: str = ""
+    retrieval_confidence: float | None = None
+    selected_doc_id: str | None = None
 
 
 @dataclass
@@ -248,6 +259,8 @@ class StreamingVoiceController(FrameProcessor):
         self._turn_counter = 0
         self._state: TurnState | None = None
         self._metrics_by_turn: dict[int, TurnMetrics] = {}
+        self._latency_observer: Any | None = None
+        self._latest_voiced_audio_at: float | None = None
 
     @property
     def metrics_by_turn(self) -> dict[int, TurnMetrics]:
@@ -321,18 +334,33 @@ class StreamingVoiceController(FrameProcessor):
         self._turn_counter += 1
         metrics = TurnMetrics(turn_id=self._turn_counter)
         metrics.endpoint_profile = getattr(self, "_endpoint_profile", "")
+        # Attach fresh voiced audio timestamp if available
+        obs_latest = None
+        if getattr(self, "_latency_observer", None) is not None:
+            obs_latest = self._latency_observer._latest_voiced_audio_at
+        if obs_latest is None:
+            obs_latest = self._latest_voiced_audio_at
+        if obs_latest is not None:
+            freshness_ms = float(os.getenv("V2_VOICE_TIMESTAMP_FRESHNESS_MS", "1000"))
+            if (time.perf_counter() - obs_latest) * 1000 <= freshness_ms:
+                metrics.last_voiced_at = obs_latest
         self._metrics_by_turn[self._turn_counter] = metrics
         self._state = TurnState(turn_id=self._turn_counter, metrics=metrics)
 
     def _mark_voice(self, audio: bytes) -> None:
-        state = self._state
-        if state is None or state.committed or len(audio) < 2:
+        if len(audio) < 2:
             return
         aligned = audio[: len(audio) - len(audio) % 2]
         samples = memoryview(aligned).cast("h")
         rms = math.sqrt(sum(int(sample) * int(sample) for sample in samples) / len(samples)) if samples else 0.0
         if rms >= self._VOICE_LEVEL:
-            state.metrics.last_voiced_at = time.perf_counter()
+            now = time.perf_counter()
+            self._latest_voiced_audio_at = now
+            if getattr(self, "_latency_observer", None) is not None:
+                self._latency_observer._latest_voiced_audio_at = now
+            state = self._state
+            if state is not None and not state.committed:
+                state.metrics.last_voiced_at = now
 
     async def _on_interim(self, text: str) -> None:
         state = self._state
@@ -571,7 +599,11 @@ class StreamingVoiceController(FrameProcessor):
         state.answer_finished = True
         if self._transcript_callback:
             self._transcript_callback("assistant", text)
-        state.metrics.tts_requested_at = time.perf_counter()
+        now = time.perf_counter()
+        if state.metrics.response_release_at is None:
+            state.metrics.response_release_at = now
+        if state.metrics.tts_requested_at is None:
+            state.metrics.tts_requested_at = now
         await self._publish_answer_to_conversation(text)
         # The assistant aggregator is the canonical same-call dialogue store.
         # Preserve fixed/deterministic speech in that context just like hosted
@@ -626,7 +658,14 @@ class LiveLatencyObserver(BaseObserver):
         self._call_origin_at = call_origin_at
         self._seen: set[int] = set()
         self._reported_turn_ids: set[int] = set()
+        self._reporting_turn_ids: set[int] = set()
         self._cadence_seen: set[int] = set()
+        self._latest_voiced_audio_at: float | None = None
+        self._voice_freshness_ms = float(os.getenv("V2_VOICE_TIMESTAMP_FRESHNESS_MS", "1000"))
+        # Output frames can arrive after the controller has opened the next
+        # caller turn. Capture the response owner when speech starts instead
+        # of resolving late PCM/stop frames through mutable ``_state``.
+        self._active_response_metrics: TurnMetrics | None = None
         self._samples: dict[str, list[int]] = {}
         self._audible_samples: dict[str, list[int]] = {}
         self._audible_threshold = int(os.getenv("V2_AUDIBLE_PCM_RMS", "200"))
@@ -654,13 +693,28 @@ class LiveLatencyObserver(BaseObserver):
         """
         if data.direction != FrameDirection.DOWNSTREAM:
             return
+        if isinstance(data.frame, InputAudioRawFrame):
+            audio = data.frame.audio
+            if len(audio) >= 2:
+                aligned = audio[: len(audio) - len(audio) % 2]
+                samples = memoryview(aligned).cast("h")
+                rms = math.sqrt(sum(int(s) * int(s) for s in samples) / len(samples)) if samples else 0.0
+                if rms >= self._audible_threshold:
+                    now = time.perf_counter()
+                    self._latest_voiced_audio_at = now
+                    state = self._controller._state
+                    if state is not None and not state.committed:
+                        state.metrics.last_voiced_at = now
+            return
         if not isinstance(data.processor, BaseOutputTransport) or not isinstance(data.frame, TTSAudioRawFrame):
             return
-        state = self._controller._state
-        if state is None or state.metrics.tts_requested_at is None:
+        metrics = self._active_response_metrics
+        if metrics is None:
+            state = self._controller._state
+            metrics = state.metrics if state is not None else None
+        if metrics is None or metrics.tts_requested_at is None:
             return
         now = time.perf_counter()
-        metrics = state.metrics
         if metrics.output_first_packet_at is None:
             metrics.output_first_packet_at = now
         if metrics.output_last_packet_at is not None:
@@ -687,16 +741,34 @@ class LiveLatencyObserver(BaseObserver):
             and audible
         ):
             metrics.output_first_non_silent_at = now
-            self._schedule_report_if_not_reported(state)
+            self._schedule_report_if_not_reported(metrics)
 
     async def on_push_frame(self, data: FramePushed):
         if data.direction != FrameDirection.DOWNSTREAM or data.frame.id in self._seen:
             return
         self._seen.add(data.frame.id)
-        state = self._controller._state
-        if state is None:
+        if isinstance(data.frame, InputAudioRawFrame):
+            audio = data.frame.audio
+            if len(audio) >= 2:
+                aligned = audio[: len(audio) - len(audio) % 2]
+                samples = memoryview(aligned).cast("h")
+                rms = math.sqrt(sum(int(s) * int(s) for s in samples) / len(samples)) if samples else 0.0
+                if rms >= self._audible_threshold:
+                    now = time.perf_counter()
+                    self._latest_voiced_audio_at = now
+                    state = self._controller._state
+                    if state is not None and not state.committed:
+                        state.metrics.last_voiced_at = now
             return
-        metrics = state.metrics
+        state = self._controller._state
+        if isinstance(data.frame, (LLMFullResponseStartFrame, TTSSpeakFrame)):
+            if state is not None and state.metrics.tts_requested_at is not None:
+                self._active_response_metrics = state.metrics
+        metrics = self._active_response_metrics
+        if metrics is None and state is not None and state.metrics.tts_requested_at is not None:
+            metrics = state.metrics
+        if metrics is None:
+            return
         # No current response has requested speech yet. Audio here belongs to
         # the greeting or an interrupted older response, not this caller turn.
         if metrics.tts_requested_at is None:
@@ -712,14 +784,14 @@ class LiveLatencyObserver(BaseObserver):
             # This is only a fallback. When PCM metrics are enabled, wait for
             # actual non-silent output PCM so the report is caller-perceived.
             if not self._audible_metrics_enabled:
-                self._schedule_report_if_not_reported(state)
+                self._schedule_report_if_not_reported(metrics)
         if (
             isinstance(data.frame, (BotStoppedSpeakingFrame, TTSStoppedFrame))
             and metrics.turn_id not in self._cadence_seen
         ):
             # Final safety net: report even if no inspectable output PCM or
             # BotStartedSpeakingFrame was observed.
-            self._schedule_report_if_not_reported(state)
+            self._schedule_report_if_not_reported(metrics)
             self._cadence_seen.add(metrics.turn_id)
             logger.info(
                 "AUDIO CADENCE | turn={} packets={} audio_ms={} max_packet_gap_ms={} long_gaps={} silent_packets={}",
@@ -745,78 +817,90 @@ class LiveLatencyObserver(BaseObserver):
                     sort_keys=True,
                 ),
             )
+            self._active_response_metrics = None
 
-    def _schedule_report_if_not_reported(self, state) -> None:
-        if state.metrics.turn_id not in self._reported_turn_ids:
-            self._reported_turn_ids.add(state.metrics.turn_id)
-            asyncio.create_task(self._report_latency(state))
+    @staticmethod
+    def _metrics_for(value) -> TurnMetrics:
+        return getattr(value, "metrics", value)
 
-    async def _report_latency(self, state) -> None:
-        metrics = state.metrics
-        first_audible = (
-            metrics.output_first_non_silent_at
-            if self._audible_metrics_enabled
-            else metrics.bot_started_at
-        )
-        breakdown = LatencyBreakdown.from_turn(
-            metrics,
-            model=getattr(self._controller, "_model", "unknown"),
-            tts_transport=self._tts_transport,
-            require_audible_pcm=self._audible_metrics_enabled,
-        )
-        native_eot_to_audio = self._ms(metrics.turn_committed_at, metrics.bot_started_at)
-        raw_audio_to_eot = self._ordered_ms(metrics.last_voiced_at, metrics.turn_committed_at)
-        raw_audio_to_bot = self._ordered_ms(metrics.last_voiced_at, first_audible)
-        if native_eot_to_audio is not None and metrics.route not in {"v2-error", "stt-empty-retry"}:
-            self._samples.setdefault(metrics.route, []).append(native_eot_to_audio)
-        eot_to_audible = self._ms(metrics.turn_committed_at, first_audible)
-        if eot_to_audible is not None and metrics.route not in {"v2-error", "stt-empty-retry"}:
-            self._audible_samples.setdefault(metrics.route, []).append(eot_to_audible)
-        report_lines = [
-            "RESPONSE LATENCY | "
-            f"tenant={getattr(self._session, 'tenant_id', 'legacy')} bundle={getattr(getattr(self._session, 'agent', None), 'version', 'legacy')} "
-            f"state={getattr(self._session, 'state', {}).get('name', 'UNKNOWN') if self._session else 'LEGACY'} "
-            f"turn={metrics.turn_id} route={metrics.route} tts={self._tts_transport} speculation={metrics.speculation} spec_tts={metrics.spec_tts} spec_tts_reason={metrics.spec_tts_reason or 'none'} | "
-            f"provider-turn={metrics.provider_turn_id} eot-trigger={metrics.eot_trigger} eot-confidence={metrics.eot_confidence} "
-            f"provider-EOT->aggregator={self._ms(metrics.provider_eot_at, metrics.aggregator_stop_at)} ms | "
-            f"native-EOT->bot-audio={native_eot_to_audio} ms | raw-audio->native-EOT={raw_audio_to_eot} ms | "
-            f"raw-audio->first-audible={raw_audio_to_bot} ms | "
-            f"LLM-request->stream={self._ms(metrics.llm_request_started_at, metrics.llm_stream_opened_at)} ms | "
-            f"LLM-stream->first-token={self._ms(metrics.llm_stream_opened_at, metrics.llm_first_token_at)} ms | "
-            f"first-token->filtered={self._ms(metrics.llm_first_token_at, metrics.first_filtered_text_at)} ms | "
-            f"filtered->safe={self._ms(metrics.first_filtered_text_at, metrics.first_safe_text_at)} ms | "
-            f"EOT->first-safe-text={self._ms(metrics.turn_committed_at, metrics.first_safe_text_at)} ms | "
-            f"EOT->first-audible={eot_to_audible} ms | "
-            f"input-gaps={metrics.input_gap_count} input-max-gap={metrics.input_gap_max_ms} ms"
-        ]
-        logger.info("\n".join(report_lines))
-        coverage = self._optimization_coverage()
-        logger.info(
-            "V2 OPTIMIZATION METRICS | turn={} deterministic_coverage={} hosted_llm_coverage={} "
-            "stable_spec_lead_eager_ms={} stable_spec_lead_hard_eot_ms={} semantic_spec_hit={} "
-            "spec_tts_eligible={} spec_tts_started={} spec_tts_pcm_ready={} spec_tts_committed={} "
-            "knowledge_direct_hit={} first_token_to_first_safe_text_ms={} "
-            "hard_eot_to_first_audible_ms={} raw_speech_end_to_first_audible_ms={}",
-            metrics.turn_id,
-            coverage["deterministic_coverage"], coverage["hosted_llm_coverage"],
-            self._lead_ms(metrics.stable_candidate_started_at, metrics.eager_eot_at),
-            self._lead_ms(metrics.stable_candidate_started_at, metrics.turn_committed_at),
-            coverage["semantic_spec_hit"], coverage["spec_tts_eligible"],
-            coverage["spec_tts_started"], coverage["spec_tts_pcm_ready"],
-            coverage["spec_tts_committed"], coverage["knowledge_direct_hit"],
-            self._ms(metrics.llm_first_token_at, metrics.first_safe_text_at),
-            eot_to_audible, raw_audio_to_bot,
-        )
-        if breakdown is not None:
-            await self._call_event_handler("on_latency_breakdown", breakdown)
-        else:
-            logger.warning(
-                "LATENCY BREAKDOWN UNAVAILABLE | turn={} route={} "
-                "hard_eot={} output_first_non_silent={} bot_started={}",
-                metrics.turn_id, metrics.route, metrics.turn_committed_at,
-                metrics.output_first_non_silent_at, metrics.bot_started_at,
+    def _schedule_report_if_not_reported(self, response) -> None:
+        metrics = self._metrics_for(response)
+        if metrics.turn_id in self._reported_turn_ids or metrics.turn_id in self._reporting_turn_ids:
+            return
+        self._reporting_turn_ids.add(metrics.turn_id)
+        asyncio.create_task(self._report_latency(metrics))
+
+    async def _report_latency(self, response) -> None:
+        metrics = self._metrics_for(response)
+        try:
+            first_audible = (
+                metrics.output_first_non_silent_at
+                if self._audible_metrics_enabled
+                else metrics.bot_started_at
             )
-        logger.info("LATENCY RECORD | {}", json.dumps(self._record(metrics, breakdown, first_audible), sort_keys=True))
+            breakdown = LatencyBreakdown.from_turn(
+                metrics,
+                model=getattr(self._controller, "_model", "unknown"),
+                tts_transport=self._tts_transport,
+                require_audible_pcm=self._audible_metrics_enabled,
+            )
+            native_eot_to_audio = self._ms(metrics.turn_committed_at, metrics.bot_started_at)
+            raw_audio_to_eot = self._ordered_ms(metrics.last_voiced_at, metrics.turn_committed_at)
+            raw_audio_to_bot = self._ordered_ms(metrics.last_voiced_at, first_audible)
+            if native_eot_to_audio is not None and metrics.route not in {"v2-error", "stt-empty-retry"}:
+                self._samples.setdefault(metrics.route, []).append(native_eot_to_audio)
+            eot_to_audible = self._ms(metrics.turn_committed_at, first_audible)
+            if eot_to_audible is not None and metrics.route not in {"v2-error", "stt-empty-retry"}:
+                self._audible_samples.setdefault(metrics.route, []).append(eot_to_audible)
+            report_lines = [
+                "RESPONSE LATENCY | "
+                f"tenant={getattr(self._session, 'tenant_id', 'legacy')} bundle={getattr(getattr(self._session, 'agent', None), 'version', 'legacy')} "
+                f"state={getattr(self._session, 'state', {}).get('name', 'UNKNOWN') if self._session else 'LEGACY'} "
+                f"turn={metrics.turn_id} route={metrics.route} tts={self._tts_transport} speculation={metrics.speculation} spec_tts={metrics.spec_tts} spec_tts_reason={metrics.spec_tts_reason or 'none'} | "
+                f"provider-turn={metrics.provider_turn_id} eot-trigger={metrics.eot_trigger} eot-confidence={metrics.eot_confidence} "
+                f"provider-EOT->aggregator={self._ms(metrics.provider_eot_at, metrics.aggregator_stop_at)} ms | "
+                f"native-EOT->bot-audio={native_eot_to_audio} ms | raw-audio->native-EOT={raw_audio_to_eot} ms | "
+                f"raw-audio->first-audible={raw_audio_to_bot} ms | "
+                f"LLM-request->stream={self._ms(metrics.llm_request_started_at, metrics.llm_stream_opened_at)} ms | "
+                f"LLM-stream->first-token={self._ms(metrics.llm_stream_opened_at, metrics.llm_first_token_at)} ms | "
+                f"first-token->speech-filter={self._ms(metrics.llm_first_token_at, metrics.first_speech_filter_text_at)} ms | "
+                f"speech-filter->booking-safe={self._ms(metrics.first_speech_filter_text_at, metrics.first_filtered_text_at)} ms | "
+                f"booking-safe->safe-chunk={self._ms(metrics.first_filtered_text_at, metrics.first_safe_text_at)} ms | "
+                f"EOT->first-safe-text={self._ms(metrics.turn_committed_at, metrics.first_safe_text_at)} ms | "
+                f"EOT->first-audible={eot_to_audible} ms | "
+                f"input-gaps={metrics.input_gap_count} input-max-gap={metrics.input_gap_max_ms} ms"
+            ]
+            logger.info("\n".join(report_lines))
+            coverage = self._optimization_coverage()
+            logger.info(
+                "V2 OPTIMIZATION METRICS | turn={} deterministic_coverage={} hosted_llm_coverage={} "
+                "stable_spec_lead_eager_ms={} stable_spec_lead_hard_eot_ms={} semantic_spec_hit={} "
+                "spec_tts_eligible={} spec_tts_started={} spec_tts_pcm_ready={} spec_tts_committed={} "
+                "knowledge_direct_hit={} first_token_to_first_safe_text_ms={} "
+                "hard_eot_to_first_audible_ms={} raw_speech_end_to_first_audible_ms={}",
+                metrics.turn_id,
+                coverage["deterministic_coverage"], coverage["hosted_llm_coverage"],
+                self._lead_ms(metrics.stable_candidate_started_at, metrics.eager_eot_at),
+                self._lead_ms(metrics.stable_candidate_started_at, metrics.turn_committed_at),
+                coverage["semantic_spec_hit"], coverage["spec_tts_eligible"],
+                coverage["spec_tts_started"], coverage["spec_tts_pcm_ready"],
+                coverage["spec_tts_committed"], coverage["knowledge_direct_hit"],
+                self._ms(metrics.llm_first_token_at, metrics.first_safe_text_at),
+                eot_to_audible, raw_audio_to_bot,
+            )
+            if breakdown is not None:
+                self._reported_turn_ids.add(metrics.turn_id)
+                await self._call_event_handler("on_latency_breakdown", breakdown)
+            else:
+                logger.warning(
+                    "LATENCY BREAKDOWN UNAVAILABLE | turn={} route={} "
+                    "hard_eot={} output_first_non_silent={} bot_started={}",
+                    metrics.turn_id, metrics.route, metrics.turn_committed_at,
+                    metrics.output_first_non_silent_at, metrics.bot_started_at,
+                )
+            logger.info("LATENCY RECORD | {}", json.dumps(self._record(metrics, breakdown, first_audible), sort_keys=True))
+        finally:
+            self._reporting_turn_ids.discard(metrics.turn_id)
 
     def _record(self, metrics, breakdown, first_audible):
         return {
@@ -859,6 +943,7 @@ class LiveLatencyObserver(BaseObserver):
             "llm_stream_opened_at": metrics.llm_stream_opened_at,
             "llm_first_token_at": metrics.llm_first_token_at,
             "first_filtered_text_at": metrics.first_filtered_text_at,
+            "first_speech_filter_text_at": metrics.first_speech_filter_text_at,
             "candidate_validated_at": metrics.candidate_validated_at,
             "candidate_promoted_at": metrics.candidate_promoted_at,
             "first_safe_text_at": metrics.first_safe_text_at,
@@ -892,10 +977,55 @@ class LiveLatencyObserver(BaseObserver):
             "context_selection_ms": metrics.context_selection_ms,
             "context_token_estimation_ms": metrics.context_token_estimation_ms,
             "prompt_build_ms": metrics.prompt_build_ms,
+            "pipecat_context_messages_total": metrics.pipecat_context_messages_total,
+            "recent_context_messages_selected": metrics.recent_context_messages_selected,
+            "recent_context_tokens": metrics.recent_context_tokens,
+            "total_prompt_tokens": metrics.total_prompt_tokens,
+            "retrieval_query": metrics.retrieval_query,
+            "retrieval_confidence": metrics.retrieval_confidence,
+            "selected_doc_id": metrics.selected_doc_id,
             "latency_breakdown": breakdown.as_dict() if breakdown is not None else None,
         }
 
     async def cleanup(self):
+        metrics_by_turn = getattr(self._controller, "metrics_by_turn", {})
+        response_turns = [m for m in metrics_by_turn.values() if m.tts_requested_at is not None]
+        audible_turns = [m for m in response_turns if m.output_first_non_silent_at is not None]
+        missing_reports = [m.turn_id for m in audible_turns if m.turn_id not in self._reported_turn_ids]
+        report_without_response = [
+            turn_id for turn_id in self._reported_turn_ids
+            if turn_id not in metrics_by_turn or metrics_by_turn[turn_id].tts_requested_at is None
+        ]
+        audible_bot_responses = sum(
+            1 for m in response_turns
+            if m.output_first_non_silent_at is not None or m.bot_started_at is not None
+        )
+        valid_latency_reports = len(self._reported_turn_ids)
+        missing_speech_end_timestamps = sum(
+            1 for m in metrics_by_turn.values()
+            if m.tts_requested_at is not None and (m.last_voiced_at is None or m.turn_committed_at is None)
+        )
+        phantom_pending_reports = sum(
+            1 for tid in self._reported_turn_ids
+            if tid in metrics_by_turn and (
+                metrics_by_turn[tid].route == "pending"
+                or metrics_by_turn[tid].tts_requested_at is None
+            )
+        )
+        logger.info(
+            "LATENCY INTEGRITY | responses={} audible={} reports={} missing_audible_reports={} reports_without_response={}",
+            len(response_turns), len(audible_turns), len(self._reported_turn_ids),
+            missing_reports, report_without_response,
+        )
+        logger.info(
+            "LATENCY CALL-END INTEGRITY | audible_bot_responses={} valid_latency_reports={} "
+            "missing_speech_end_timestamps={} phantom_pending_reports={}",
+            audible_bot_responses,
+            valid_latency_reports,
+            missing_speech_end_timestamps,
+            phantom_pending_reports,
+        )
+        self._log_call_summary(list(metrics_by_turn.values()))
         if self._reported_turn_ids:
             logger.info(
                 "V2 OPTIMIZATION SUMMARY | {}",
@@ -916,6 +1046,61 @@ class LiveLatencyObserver(BaseObserver):
                 f"p90={percentile(.90)} ms p95={percentile(.95)} ms p99={percentile(.99)} ms max={ordered[-1]} ms"
             )
         await super().cleanup()
+
+    def _log_call_summary(self, all_turns: list[TurnMetrics]) -> None:
+        turns = [item for item in all_turns if item.tts_requested_at is not None]
+        successful = [
+            item for item in turns
+            if item.output_first_non_silent_at is not None
+            and item.route not in {"v2-error", "stt-empty-retry"}
+        ]
+        deterministic_routes = {
+            "fixed", "cache", "identity", "faq-direct", "callback-preference",
+            "callback-preference-acknowledged",
+        }
+
+        def values(start_name: str, end_name: str, items=successful) -> list[int]:
+            result = []
+            for item in items:
+                value = self._ms(getattr(item, start_name), getattr(item, end_name))
+                if value is not None:
+                    result.append(value)
+            return result
+
+        def stats(items: list[int]) -> str:
+            if not items:
+                return "n=0 p50=None p90=None p95=None max=None"
+            ordered = sorted(items)
+            pick = lambda p: ordered[max(0, math.ceil(len(ordered) * p) - 1)]
+            return (
+                f"n={len(ordered)} p50={pick(.50)} p90={pick(.90)} "
+                f"p95={pick(.95)} max={ordered[-1]}"
+            )
+
+        hosted = [item for item in successful if item.hosted_llm_used]
+        deterministic = [item for item in successful if item.decision_route in deterministic_routes]
+        retrieval = [item for item in successful if item.decision_route in {"cache", "faq-direct"}]
+        errors = [item for item in turns if item.route in {"v2-error", "stt-empty-retry"}]
+        context_turns = [item for item in hosted if item.recent_context_messages_selected or item.recent_context_tokens]
+        avg_messages = (
+            round(sum(item.recent_context_messages_selected for item in context_turns) / len(context_turns), 1)
+            if context_turns else 0.0
+        )
+        avg_tokens = (
+            round(sum(item.recent_context_tokens for item in context_turns) / len(context_turns), 1)
+            if context_turns else 0.0
+        )
+        logger.info(
+            "CALL LATENCY SUMMARY | total_turns={} deterministic_turns={} hosted_turns={} retrieval_turns={} error_turns={} "
+            "speech_end_to_audible=[{}] speech_end_to_hard_eot=[{}] hosted_llm_ttft=[{}] "
+            "tts_first_pcm=[{}] avg_context_messages={} avg_context_tokens={}",
+            len(all_turns), len(deterministic), len(hosted), len(retrieval), len(errors),
+            stats(values("last_voiced_at", "output_first_non_silent_at")),
+            stats(values("last_voiced_at", "turn_committed_at")),
+            stats(values("llm_request_started_at", "llm_first_token_at", hosted)),
+            stats(values("tts_requested_at", "tts_first_audio_at")),
+            avg_messages, avg_tokens,
+        )
 
     def _optimization_coverage(self) -> dict[str, str]:
         metrics_by_turn = getattr(self._controller, "metrics_by_turn", {})
@@ -1036,7 +1221,7 @@ async def run_bot(
         )
         cached_greeting = greeting_cache.get(greeting_key)
     endpoint_profile_preset = os.getenv("V2_ENDPOINT_PROFILE_PRESET", "current").lower()
-    tts_buffer_ms = int(os.getenv("CARTESIA_MAX_BUFFER_DELAY_MS", os.getenv("V2_TTS_BUFFER_DELAY_MS", "150")))
+    tts_buffer_ms = int(os.getenv("CARTESIA_MAX_BUFFER_DELAY_MS", os.getenv("V2_TTS_BUFFER_DELAY_MS", "75")))
     logger.info(
         "TURN config model={} stt={} endpointing_ms={} vad_stop_secs={} strategy={} flux_preset={} tts_buffer_ms={}",
         runtime.llm_model,
@@ -1127,11 +1312,25 @@ async def run_bot(
         session=v2_session if controller_options else None,
         call_origin_at=telephony_connected_at,
     )
+    controller._latency_observer = latency_observer
 
     @latency_observer.event_handler("on_latency_breakdown")
     async def on_latency_breakdown(_observer, breakdown):
+        metrics = controller.metrics_by_turn.get(breakdown.turn_id)
+        context_lines = ""
+        if metrics is not None:
+            context_lines = (
+                "\n"
+                f"context_messages={metrics.recent_context_messages_selected} "
+                f"context_tokens={metrics.recent_context_tokens} "
+                f"total_prompt_tokens={metrics.total_prompt_tokens}\n"
+                f"pipecat_context_read_ms={metrics.pipecat_context_read_ms} "
+                f"context_selection_ms={metrics.context_selection_ms} "
+                f"context_token_estimation_ms={metrics.context_token_estimation_ms} "
+                f"prompt_build_ms={metrics.prompt_build_ms}"
+            )
         logger.info(
-            "── LATENCY BREAKDOWN | turn={} ──\n{}",
+            "── LATENCY BREAKDOWN | turn={} ──\n{}{}",
             breakdown.turn_id,
             "\n".join(
                 f"  {line}"
@@ -1139,6 +1338,7 @@ async def run_bot(
                     latency_observer._breakdown_min_secs
                 )
             ),
+            context_lines,
         )
     context = LLMContext()
     # Flux owns start, resume and hard-EOT detection.  Giving the aggregator
@@ -1190,8 +1390,6 @@ async def run_bot(
                 content=message.content or "",
                 interrupted=bool(message.interrupted),
             )
-            if controller._state:
-                latency_observer._schedule_report_if_not_reported(controller._state)
     keyterms = list(v2_session.agent.stt_profile.get("keyterms", [])) if controller_options else []
     if controller_options:
         initial_state = str(v2_session.state.get("name", "OPEN"))
@@ -1295,7 +1493,7 @@ async def run_bot(
             # successive phrase chunks when the LLM streams tokens slowly, avoiding
             # the elongated-word / dropout artefact on slow-LLM turns.
             text_aggregation_mode=(TextAggregationMode.TOKEN if controller_options else TextAggregationMode.SENTENCE),
-            max_buffer_delay_ms=int(os.getenv("CARTESIA_MAX_BUFFER_DELAY_MS", os.getenv("V2_TTS_BUFFER_DELAY_MS", "150"))) if controller_options else None,
+            max_buffer_delay_ms=int(os.getenv("CARTESIA_MAX_BUFFER_DELAY_MS", os.getenv("V2_TTS_BUFFER_DELAY_MS", "75"))) if controller_options else None,
         )
     pipeline_processors = [transport.input(), stt, controller, user_aggregator, tts]
     if controller_options and os.getenv("ENABLE_TTS_LEADING_SILENCE_TRIM", "true").lower() == "true":

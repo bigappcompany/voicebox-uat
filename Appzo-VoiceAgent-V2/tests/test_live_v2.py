@@ -80,6 +80,13 @@ class LiveRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.controller.push_frame.await_args.args[0].text, "Nine to five.")
         self.client.chat.completions.create.assert_not_awaited()
 
+    async def test_unsupported_blue_white_collar_faq_does_not_invent_answer(self):
+        state = await self.answer("do you support blue collar and white collar jobs")
+        self.assertEqual(state.metrics.route, "v2-fixed")
+        self.client.chat.completions.create.assert_not_awaited()
+        speech = self.controller.push_frame.await_args.args[0].text.casefold()
+        self.assertIn("doesn't confirm", speech)
+
     async def test_negated_goodbye_uses_hosted_and_strips_split_markers(self):
         stream = FakeStream(["OK|Do not worry. E", "ND", "|"])
         self.client.chat.completions.create.return_value = stream
@@ -229,6 +236,51 @@ class LiveRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.metrics.route, "v2-callback-preference")
         self.client.chat.completions.create.assert_not_awaited()
         self.assertIn("not a confirmed booking", self.controller.push_frame.await_args.args[0].text)
+
+    async def test_compound_callback_time_and_faq_persists_preference(self):
+        self.controller.session.slots["callback_state"] = "AWAITING_DAY_TIME"
+        self.controller.session.pending_question = PendingQuestion(
+            "ask_callback_day_time", "callback_preference", "date_and_time", 0
+        )
+        self.client.chat.completions.create.return_value = FakeStream([
+            "We provide permanent and contract staffing."
+        ])
+        state = await self.answer(
+            "tomorrow three pm but first tell me what services you provide"
+        )
+        self.assertEqual(state.metrics.route, "v2-hosted")
+        self.assertEqual(self.controller.session.slots["callback_day"], "tomorrow")
+        self.assertIn("three", self.controller.session.slots["callback_time"])
+        self.assertEqual(
+            self.controller.session.slots["callback_state"], "PREFERENCE_RECORDED"
+        )
+
+    async def test_natural_callback_yes_and_no_do_not_call_model(self):
+        self.controller.session.slots["callback_state"] = "FOLLOWUP_OFFERED"
+        self.controller.session.pending_question = PendingQuestion(
+            "ask_callback_consent", "followup_consent", "boolean", 0
+        )
+        yes_state = await self.answer("that is true yeah")
+        self.assertEqual(yes_state.metrics.route, "v2-fixed")
+        self.assertEqual(self.controller.session.slots["followup_consent"], "yes")
+        self.client.chat.completions.create.assert_not_awaited()
+
+        await self.controller._start_turn()
+        self.controller.session.slots["callback_state"] = "FOLLOWUP_OFFERED"
+        self.controller.session.pending_question = PendingQuestion(
+            "ask_callback_consent", "followup_consent", "boolean", 1
+        )
+        no_state = await self.answer("yeah no dont do that")
+        self.assertEqual(no_state.metrics.route, "v2-fixed")
+        self.assertEqual(self.controller.session.slots["followup_consent"], "no")
+        self.client.chat.completions.create.assert_not_awaited()
+
+    def test_anything_else_question_is_not_callback_consent(self):
+        pending = self.controller._pending_from_speech(
+            "I've recorded tomorrow for follow-up. Is there anything else?", 4
+        )
+        self.assertEqual(pending.slot, "conversation_continue")
+        self.assertEqual(pending.expected_type, "boolean")
 
     async def test_callback_preference_acknowledgement_stays_local_and_unconfirmed(self):
         self.controller.session.slots.update(

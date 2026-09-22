@@ -1,4 +1,5 @@
-"""Preserve native Flux stop signals and finalize as soon as text arrives."""
+import asyncio
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -22,6 +23,34 @@ class OrderedFluxSTTService(DeepgramFluxSTTService):
         self._input_gap_count = 0
         self._input_gap_max_ms = 0.0
         self._turn_resumed_count = 0
+
+    async def _watchdog_task_handler(self):
+        """Prevent dangling turns and keep connection alive during silence."""
+        while self._transport_is_active():
+            now = time.monotonic()
+            threshold = max(self._last_audio_chunk_duration * 2, self._watchdog_min_timeout)
+            if (
+                self._user_is_speaking
+                and self._last_stt_time
+                and now - self._last_stt_time > threshold
+            ):
+                try:
+                    await self._send_silence()
+                except Exception:
+                    pass
+                self._last_stt_time = time.monotonic()
+            elif (
+                not self._user_is_speaking
+                and self._last_stt_time
+                and now - self._last_stt_time > 5.0
+                and self._websocket is not None
+            ):
+                try:
+                    await self.send_with_retry(json.dumps({"type": "KeepAlive"}), self._report_error)
+                except Exception:
+                    pass
+                self._last_stt_time = time.monotonic()
+            await asyncio.sleep(0.1)
 
     async def run_stt(self, audio):
         now = time.perf_counter()
