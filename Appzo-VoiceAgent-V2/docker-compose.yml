@@ -1,0 +1,34 @@
+services:
+  voice-agent-v2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: appzo-voiceagent-v2:local
+    container_name: appzo-voiceagent-v2
+    init: true
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      GOODBOX_SERVER_HOST: 0.0.0.0
+      GOODBOX_SERVER_PORT: "8000"
+      VOICEAGENT_RUNTIME_LOG: /app/logs/voiceagent.log
+    ports:
+      - "${VOICEAGENT_PORT:-8000}:8000"
+    volumes:
+      - voiceagent-v2-logs:/app/logs
+      - voiceagent-v2-greeting-cache:/app/.runtime-cache
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/health', timeout=3).read()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  voiceagent-v2-logs:
+  voiceagent-v2-greeting-cache:
