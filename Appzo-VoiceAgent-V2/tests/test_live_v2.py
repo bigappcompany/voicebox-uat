@@ -92,6 +92,41 @@ class LiveRoutingTests(unittest.IsolatedAsyncioTestCase):
         speech = self.controller.push_frame.await_args.args[0].text.casefold()
         self.assertIn("doesn't confirm", speech)
 
+    async def test_pricing_is_deterministic_and_not_model_identity(self):
+        state = await self.answer("what's your pricing model")
+        self.assertEqual(state.metrics.route, "v2-cache")
+        self.client.chat.completions.create.assert_not_awaited()
+        self.assertIn("pricing depends", self.controller.push_frame.await_args.args[0].text.casefold())
+
+    async def test_faq_does_not_reopen_a_recorded_callback_preference(self):
+        self.controller.session.slots.update({
+            "callback_state": "PREFERENCE_RECORDED",
+            "callback_preference": "tomorrow at six pm",
+        })
+        state = await self.answer("what services do you provide")
+        self.assertEqual(state.metrics.route, "v2-cache")
+        self.assertEqual(self.controller.session.slots["callback_state"], "PREFERENCE_RECORDED")
+        self.assertNotIn("follow up", self.controller.push_frame.await_args.args[0].text.casefold())
+
+    async def test_recall_callback_uses_preference_not_booking_language(self):
+        self.controller.session.slots.update({
+            "callback_state": "PREFERENCE_RECORDED",
+            "callback_preference": "tomorrow at six pm",
+        })
+        state = await self.answer("I think we have already scheduled a follow up")
+        self.assertEqual(state.metrics.route, "v2-callback-preference-acknowledged")
+        speech = self.controller.push_frame.await_args.args[0].text.casefold()
+        self.assertIn("preferred time", speech)
+        self.assertIn("confirm availability", speech)
+        self.assertNotIn("set for", speech)
+
+    async def test_mixed_unsupported_service_and_marketing_acknowledges_marketing(self):
+        state = await self.answer("do you support blue collar jobs and marketing department")
+        self.assertEqual(state.metrics.route, "v2-fixed")
+        speech = self.controller.push_frame.await_args.args[0].text.casefold()
+        self.assertIn("marketing requirement", speech)
+        self.assertIn("doesn't confirm", speech)
+
     async def test_negated_goodbye_uses_hosted_and_strips_split_markers(self):
         stream = FakeStream(["OK|Do not worry. E", "ND", "|"])
         self.client.chat.completions.create.return_value = stream

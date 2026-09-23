@@ -60,6 +60,11 @@ class DeterministicRouter:
                 "faq:services",
                 "We provide permanent, contract, IT staffing, and apprenticeships like NAPS and NATS.",
             )
+            # A preference is not a booking, but it is complete callback
+            # information. An unrelated FAQ must not re-open consent or
+            # overwrite the recorded-preference state.
+            if str(slots.get("callback_state") or "") == "PREFERENCE_RECORDED":
+                return self._plan("cache", "faq_services", service_speech, match=match)
             next_plan, next_speech = self._next_requirement(agent, slots, match, turn_id)
             speech = f"{service_speech} {next_speech}".strip()
             plan = ResponsePlan(
@@ -73,6 +78,13 @@ class DeterministicRouter:
                 }
             )
             return plan, speech
+
+        if intent_id == "faq_pricing":
+            speech = agent.cached_utterances.get(
+                "faq:pricing",
+                "Pricing depends on the roles and hiring model. Our team can share the relevant details.",
+            )
+            return self._plan("cache", intent_id, speech, match=match)
 
         fixed = {
             "thank_you": ("thank_you", "You're welcome! Is there anything else I can help you with?", "continue"),

@@ -272,32 +272,44 @@ class FactExtractor:
         # office." The aggregate headcount remains useful to the workflow,
         # while headcount_by_role retains the detail for the prompt and CRM.
         per_role_counts: dict[str, Any] = {}
-        role_count_pattern = re.compile(
-            rf"\b(?:(about|around|roughly|approximately)\s+)?"
-            rf"(?:(a\s+couple)|({self._number_pattern})(?:\s*(?:to|-|or)\s*({self._number_pattern}))?)\s+"
-            r"(?:people|persons|employees|hires|candidates|positions|members|staff)\s+"
-            r"(?:in|for)\s+(?:the\s+)?(technology|tech|office|administration|admin)"
-            r"(?:\s+(?:department|team|roles?))?\b"
-        )
-        for role_count in role_count_pattern.finditer(normalized):
-            approximate = bool(role_count.group(1))
-            raw_first = role_count.group(3)
-            raw_second = role_count.group(4)
-            if role_count.group(2):
-                first = second = 2
-                approximate = True
-            else:
-                first, second = _number(raw_first or ""), _number(raw_second or "")
-            if first is None:
-                continue
-            role_token = role_count.group(5)
-            role = "technology" if role_token in {"technology", "tech"} else "office"
-            if role not in found:
-                found.append(role)
-            if second is not None and second != first:
-                per_role_counts[role] = NumericRange(min(first, second), max(first, second), "people", True)
-            else:
-                per_role_counts[role] = first
+        # Keep quantities attached to the role they describe. The previous
+        # matcher covered only technology and office, losing statements such
+        # as "three-four for tech and a couple for operations".
+        if isinstance(aliases, dict):
+            for role, phrases in aliases.items():
+                values = [phrases] if isinstance(phrases, str) else list(phrases or [])
+                for raw_alias in values:
+                    alias = str(raw_alias).casefold()
+                    if alias in {"it", "i.t."}:
+                        continue
+                    role_count_pattern = re.compile(
+                        rf"\b(?:(about|around|roughly|approximately)\s+)?"
+                        rf"(?:(a\s+couple)(?:\s+of)?|({self._number_pattern})"
+                        rf"(?:\s*(?:to|-|or|and)\s*|\s+)({self._number_pattern})?)\s+"
+                        r"(?:people|persons|employees|hires|candidates|positions|members|staff)\s+"
+                        rf"(?:in|for)\s+(?:my|the|our)?\s*{re.escape(alias)}"
+                        r"(?:\s+(?:department|team|roles?))?\b"
+                    )
+                    role_count = role_count_pattern.search(normalized)
+                    if not role_count:
+                        continue
+                    approximate = bool(role_count.group(1))
+                    raw_first, raw_second = role_count.group(3), role_count.group(4)
+                    if role_count.group(2):
+                        first = second = 2
+                        approximate = True
+                    else:
+                        first, second = _number(raw_first or ""), _number(raw_second or "")
+                    if first is None:
+                        continue
+                    role_name = str(role)
+                    if role_name not in found:
+                        found.append(role_name)
+                    if second is not None and second != first:
+                        per_role_counts[role_name] = NumericRange(min(first, second), max(first, second), "people", True)
+                    else:
+                        per_role_counts[role_name] = first
+                    break
 
         if per_role_counts:
             updates["headcount_by_role"] = per_role_counts

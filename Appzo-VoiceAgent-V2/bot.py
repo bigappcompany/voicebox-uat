@@ -47,7 +47,11 @@ def _as_dict(value: Any) -> dict[str, Any]:
 def _call_data(runner_args: RunnerArguments) -> dict[str, Any]:
     """Normalize Cloud call metadata for Goodbox's CALL_START contract."""
     data = _as_dict(getattr(runner_args, "body", None))
-    data.update(_as_dict(getattr(runner_args, "call_data", None)))
+    data.update({
+        key: value
+        for key, value in _as_dict(getattr(runner_args, "call_data", None)).items()
+        if value is not None and key != "body"
+    })
     data["provider"] = "plivo"
     # Cloud transports do not guarantee a distinct media stream ID. A stable
     # call ID remains suitable for transcript correlation and cache scoping.
@@ -79,6 +83,7 @@ async def bot(runner_args: RunnerArguments) -> None:
         transcript = CallTranscript(
             stream_id=call_data.get("stream_id"),
             voice_call_id=config.get("voice_call_id"),
+            call_data=call_data,
         )
         logger.info(
             "Pipecat Cloud V2 bundle ready tenant={} agent={} version={}",
@@ -102,6 +107,7 @@ async def bot(runner_args: RunnerArguments) -> None:
                     transcript.stream_id,
                     transcript.voice_call_id,
                     transcript.messages,
+                    call_data=transcript.call_data,
                 )
         finally:
             await goodbox.close()

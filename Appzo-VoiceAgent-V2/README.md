@@ -194,3 +194,34 @@ python3 scripts/record_baseline.py logs/call.log --enforce-targets --min-samples
 The report separates true `last_voiced_audio -> first_audible` measurements
 from `hard_eot -> first_audible` fallbacks. `AUDIO CADENCE` records report
 whole-utterance packet gaps to diagnose broken or word-by-word playback.
+# Local XML bridge to Pipecat Cloud
+
+Set `PIPECAT_CLOUD_PLIVO_WS_URL` in the local server environment to the deployed
+agent's Plivo endpoint, for example:
+
+```bash
+export PIPECAT_CLOUD_PLIVO_WS_URL='wss://ap-south.api.pipecat.daily.co/ws/plivo?serviceHost=ACTUAL_AGENT.ACTUAL_ORGANIZATION_SLUG'
+python3 goodbox_server.py
+```
+
+In separate terminals, run `ngrok http 8000` and then:
+
+```bash
+python3 scripts/dial_goodbox_test.py --route local --to +918274828890
+```
+
+Keep the existing `PUBLIC_BASE_URL` pointed at ngrok. Here `--route local`
+selects the local HTTP answer callback; the callback sends audio directly to
+Cloud when `PIPECAT_CLOUD_PLIVO_WS_URL` is set. An unset or empty value keeps
+the original local audio route. The callback logs `media_destination=cloud`
+without exposing the URL's metadata.
+
+The Cloud URL must match the deployed agent name, organization slug and region;
+an HTTPS `/start` URL is not a media endpoint. This bridge implements direct
+Plivo WebSocket routing, not token issuance: if the deployment requires dynamic
+WebSocket authentication, configure that handshake before testing.
+
+Deploy the updated `bot.py` metadata merge before testing. Cloud secrets need
+the existing GoodBox API configuration, AI provider keys and Plivo credentials.
+Verify `GOODBOX CALL START` and `GOODBOX CALL STOP` in Cloud logs and check the
+actual transcript in GoodBox; a passing XML test alone does not prove delivery.

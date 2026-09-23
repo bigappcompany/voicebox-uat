@@ -161,7 +161,8 @@ class CanonicalIntentModel:
         if re.search(
             r"\b(?:i\s+already\s+told\s+you|i\s+told\s+you\s+already|same\s+time\s+as\s+(?:earlier|before)|"
             r"what\s+time\s+did\s+i\s+(?:give|tell)\s+you|what\s+time\s+did\s+i\s+say|"
-            r"as\s+i\s+mentioned\s+before|as\s+mentioned\s+earlier)\b",
+            r"as\s+i\s+mentioned\s+before|as\s+mentioned\s+earlier|"
+            r"(?:we|i)\s+(?:have\s+)?already\s+(?:scheduled|set|arranged))\b",
             value,
         ):
             return IntentMatch("recall_callback_preference", .98, "recall_phrase")
@@ -171,6 +172,10 @@ class CanonicalIntentModel:
             return IntentMatch("busy", .94, "defer_phrase")
         if re.search(r"\b(?:repeat|say that again|come again|what did you say)\b", value):
             return IntentMatch("repeat", .98, "repeat_phrase")
+        # Commercial questions must win over the broad ``model`` identity
+        # matcher (for example, "what's your pricing model?").
+        if re.search(r"\b(?:price|pricing|cost|charges?|fee|fees|quote)\b", value):
+            return IntentMatch("faq_pricing", .94, "faq_phrase")
         if re.search(r"\b(?:what|which).*(?:model|ai model)|\bare you (?:an? )?(?:ai|bot)\b", value):
             return IntentMatch("model_identity", .98, "identity_phrase")
         if re.search(
@@ -180,8 +185,6 @@ class CanonicalIntentModel:
             return IntentMatch("company_identity", .98, "company_identity_phrase")
         if re.search(r"\b(?:reverse|linked list|technical issue|debug|write code|programming|coding|algorithm)\b", value):
             return IntentMatch("out_of_scope", .96, "domain_boundary")
-        if re.search(r"\b(?:price|pricing|cost|charges|fee|fees)\b", value):
-            return IntentMatch("faq_pricing", .94, "faq_phrase")
         if re.search(r"\b(?:service(?:s)?|staffing|blue collar|white collar|job types|apprenticeships?)\b", value):
             return IntentMatch("faq_services", .94, "faq_phrase")
         if re.search(r"\b(?:agency|vendor|recruiter).*(?:already|existing|currently)\b", value):
