@@ -6,9 +6,9 @@ max_session_duration = 900
 
 [git]
 repo = "bigappcompany/voicebox-uat"
-branch = "dhanush-dev"
+branch = "main"
 subdirectory = "Appzo-VoiceAgent-V2"
-dockerfile_path = "Appzo-VoiceAgent-V2/Dockerfile.cloud"
+dockerfile_path = "Appzo-VoiceAgent-V2/Dockerfile"
 
 [scaling]
 min_agents = 0
