@@ -635,6 +635,71 @@ class TestFixesItems1To7(unittest.IsolatedAsyncioTestCase):
             "yes_no",
         )
 
+    def test_option2_flux_profiles_wide_gap(self):
+        """Option 2: Flux profiles maintain a wide eager-to-hard threshold gap (>= 0.30)."""
+        from voice_agent.turns.endpoint_profiles import flux_profile
+
+        for name, expected_eager, expected_eot in [
+            ("yes_no", 0.20, 0.52),
+            ("short_entity", 0.22, 0.55),
+            ("requirements", 0.25, 0.55),
+            ("freeform", 0.28, 0.58),
+            ("fast", 0.22, 0.55),
+        ]:
+            prof = flux_profile(name)
+            self.assertAlmostEqual(prof.eager_eot_threshold, expected_eager, places=2)
+            self.assertAlmostEqual(prof.eot_threshold, expected_eot, places=2)
+            self.assertGreaterEqual(round(prof.eot_threshold - prof.eager_eot_threshold, 2), 0.30)
+
+    def test_option2_detected_profile_for_prompt(self):
+        """Option 2: Prompt-detected profiles identify targeted entity vs freeform intents."""
+        from voice_agent.turns.endpoint_profiles import detected_profile_for_prompt, profile_for_prompt
+
+        self.assertEqual(detected_profile_for_prompt("How may I help you today?"), "freeform")
+        self.assertEqual(detected_profile_for_prompt("What time tomorrow would be convenient?"), "short_entity")
+        self.assertEqual(detected_profile_for_prompt("What roles are you planning to hire for?"), "requirements")
+        self.assertEqual(detected_profile_for_prompt("Would you like a hiring specialist to follow up?"), "yes_no")
+        self.assertIsNone(detected_profile_for_prompt("Thank you for your time. Goodbye."))
+        self.assertEqual(profile_for_prompt("Thank you for your time. Goodbye."), "freeform")
+
+    async def test_option2_eager_deterministic_staging_and_reuse(self):
+        """Option 2: Deterministic plan is staged on eager input and reused on matching final transcript."""
+        from live_v2 import V2RoutingController
+        from main import TurnState
+        from voice_agent.runtime.metrics import TurnMetrics
+        from voice_agent.runtime.session import CallSession
+        from voice_agent.agents.bundle import AgentBundle
+
+        bundle = AgentBundle(
+            agent_id="test_agent",
+            version="1.0",
+            tenant_id="goodbox",
+            fact_profile={"company_name": "Goodbox"},
+            stt_profile={"provider": "deepgram"},
+        )
+        session = CallSession(
+            "test-call",
+            agent=bundle,
+            tenant_id="goodbox",
+            slots={"callback_state": "AWAITING_DAY_TIME"},
+            pending_question=PendingQuestion("ask_callback_day_time", "callback_preference", "date_and_time", 0),
+        )
+        controller = V2RoutingController("dummy_key", system_prompt="dummy_prompt", session=session)
+        state = TurnState(turn_id=1, metrics=TurnMetrics(turn_id=1))
+        controller._state = state
+
+        # Caller provides callback time on eager interim
+        await controller._start_candidate(state, "tomorrow at two pm", source="eager")
+        self.assertTrue(getattr(state.metrics, "eager_deterministic_staged", False))
+        self.assertIsNotNone(getattr(state, "eager_deterministic_speech", None))
+        self.assertIn("two pm", state.eager_deterministic_speech)
+
+        # Hard EOT arrives with matching transcript
+        state.final_transcript = "tomorrow at two pm"
+        await controller._commit_final_turn(state)
+        self.assertTrue(getattr(state.metrics, "eager_deterministic_hit", False))
+        self.assertEqual(state.metrics.decision_route, "callback-preference")
+
 
 if __name__ == "__main__":
     unittest.main()

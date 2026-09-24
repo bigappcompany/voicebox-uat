@@ -33,26 +33,27 @@ FLUX_PROFILES = {
     "balanced": FluxEndpointProfile(.55, .70, 3000),
     # The default sales-call profile favours responsiveness while retaining a
     # timeout long enough for short natural pauses.
-    "fast": FluxEndpointProfile(.35, .55, 1200),
-    # yes_no: caller gave a simple yes/no; fire quickly, accept a few mis-fires.
-    "yes_no": FluxEndpointProfile(.30, .50, 500),
-    # short_entity: name / date / company — short pause after the answer.
-    "short_entity": FluxEndpointProfile(.30, .52, 700),
+    "fast": FluxEndpointProfile(.22, .55, 1200),
+    # yes_no: caller gave a simple yes/no; eager fires on initial cadence inflection (.20),
+    # hard EOT secures high-confidence confirmation (.52).
+    "yes_no": FluxEndpointProfile(.20, .52, 500),
+    # short_entity: name / date / time — 150ms eager lead for TTS pre-warming.
+    "short_entity": FluxEndpointProfile(.22, .55, 750),
     # requirements: caller listing roles / headcount — needs a longer window to
-    # complete a sentence, but shorter than freeform to avoid 1-2 s pauses.
-    "requirements": FluxEndpointProfile(.30, .50, 900),
+    # complete a sentence, but wider eager gap allows background candidate generation.
+    "requirements": FluxEndpointProfile(.25, .55, 1000),
     # freeform: open-ended answer — match old requirements timeout so we don't
-    # cut off mid-sentence while being twice as fast as the old 2200 ms.
-    "freeform": FluxEndpointProfile(.35, .55, 1400),
+    # cut off mid-sentence while eager at .28 gives early speculation start.
+    "freeform": FluxEndpointProfile(.28, .58, 1400),
 }
 
 LATENCY_TEST_FLUX_PROFILES = {
     "balanced": FluxEndpointProfile(.55, .70, 3000),
-    "fast": FluxEndpointProfile(.35, .55, 1200),
-    "yes_no": FluxEndpointProfile(.30, .50, 400),
-    "short_entity": FluxEndpointProfile(.30, .52, 550),
-    "requirements": FluxEndpointProfile(.30, .50, 750),
-    "freeform": FluxEndpointProfile(.35, .55, 1100),
+    "fast": FluxEndpointProfile(.22, .55, 1200),
+    "yes_no": FluxEndpointProfile(.20, .52, 400),
+    "short_entity": FluxEndpointProfile(.22, .55, 550),
+    "requirements": FluxEndpointProfile(.25, .55, 750),
+    "freeform": FluxEndpointProfile(.28, .58, 1100),
 }
 
 
@@ -62,8 +63,8 @@ def flux_profile(name: str) -> FluxEndpointProfile:
     return profiles.get(name.casefold(), profiles["fast"])
 
 
-def profile_for_prompt(text: str) -> str:
-    """Choose the next turn's profile from the question just spoken."""
+def detected_profile_for_prompt(text: str) -> str | None:
+    """Detect a targeted endpoint profile from the question just spoken, or None if unspecific."""
     value = " ".join(text.casefold().split())
     # Ask for detailed hiring requirements before looking for a yes/no shape:
     # "Could you share the roles ...?" is grammatically a question but is not
@@ -76,7 +77,7 @@ def profile_for_prompt(text: str) -> str:
         return "short_entity"
     # Open-ended questions asking for elaboration or explanation need freeform
     if re.search(
-        r"\b(?:tell me (?:more|a little more)|what else|how can i|help you with|anything else|"
+        r"\b(?:tell me (?:more|a little more)|what else|how (?:can|may) i|help (?:you|with)|anything else|"
         r"explain|describe|more about|share more)\b",
         value,
     ):
@@ -88,4 +89,9 @@ def profile_for_prompt(text: str) -> str:
         value,
     ):
         return "yes_no"
-    return "freeform"
+    return None
+
+
+def profile_for_prompt(text: str) -> str:
+    """Choose the next turn's profile from the question just spoken."""
+    return detected_profile_for_prompt(text) or "freeform"

@@ -45,7 +45,7 @@ from voice_agent.speech.speculative_cartesia import SpeculativeCartesiaBuffer
 from voice_agent.speech.stream_filter import SpeechStreamFilter
 from voice_agent.speech.booking_guard import BookingClaimGuard
 from voice_agent.turns.transcript_stability import TranscriptStabilityAnalyzer
-from voice_agent.turns.endpoint_profiles import profile_for_prompt
+from voice_agent.turns.endpoint_profiles import profile_for_prompt, detected_profile_for_prompt
 
 _LOW_INFO_FRAGMENTS = frozenset({
     "hiria", "very", "uh", "um", "ah", "hmm", "ha", "er", "oh", "huh",
@@ -377,7 +377,14 @@ class V2RoutingController(StreamingVoiceController):
             basis, slots=provisional_slots, pending_question=self.session.pending_question,
             current_facts=provisional_facts,
         )
-        if speech is not None or plan.risk_class not in {"LOW_PUBLIC", "LOW_WORKFLOW"} or plan.tool_name:
+        if speech is not None:
+            state.eager_deterministic_plan = plan
+            state.eager_deterministic_speech = speech
+            state.eager_deterministic_basis = basis
+            state.eager_deterministic_slots = provisional_slots
+            state.metrics.eager_deterministic_staged = True
+            return
+        if plan.risk_class not in {"LOW_PUBLIC", "LOW_WORKFLOW"} or plan.tool_name:
             return
         fingerprint = self._fingerprint(basis, plan, slots=provisional_slots)
         old = state.candidate
@@ -579,10 +586,22 @@ class V2RoutingController(StreamingVoiceController):
             self._transcript_callback("user", text)
 
         current_facts = facts.values if self.flags.enable_structured_facts else {}
-        plan, speech = self._response_plan(
-            text, slots=self.session.visible_facts(), pending_question=self.session.pending_question,
-            current_facts=current_facts,
-        )
+        if (
+            getattr(state, "eager_deterministic_speech", None) is not None
+            and text == getattr(state, "eager_deterministic_basis", None)
+        ):
+            plan = state.eager_deterministic_plan
+            speech = state.eager_deterministic_speech
+            state.metrics.eager_deterministic_hit = True
+            logger.debug(
+                "V2 EAGER DETERMINISTIC HIT turn={} route={} speech='{}'",
+                state.turn_id, plan.route, speech[:40],
+            )
+        else:
+            plan, speech = self._response_plan(
+                text, slots=self.session.visible_facts(), pending_question=self.session.pending_question,
+                current_facts=current_facts,
+            )
         state.metrics.decision_route = plan.route
         state.metrics.decision_intent = plan.intent_id or "unknown"
         state.metrics.decision_reason = plan.decision_reason
@@ -1457,10 +1476,12 @@ class V2RoutingController(StreamingVoiceController):
         state_name = str(self.session.state.get("name", "OPEN"))
         states = self.session.agent.flow_graph.get("states") or {}
         state_config = states.get(state_name, {}) if isinstance(states, dict) else {}
+        prompt_profile = detected_profile_for_prompt(speech) if speech else None
         name = str(
             self._deferred_endpoint_profile
+            or prompt_profile
             or state_config.get("endpoint_profile")
-            or profile_for_prompt(speech)
+            or "freeform"
         )
         self._deferred_endpoint_profile = None
         if name == "yes_no" and self.session.pending_question and self.session.pending_question.expected_type not in {"boolean", "yes_no"}:
