@@ -15,7 +15,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from xml.sax.saxutils import escape
 
 import httpx
@@ -93,6 +93,29 @@ def _websocket_url(public_base_url: str, path: str, query: dict[str, str]) -> st
     return urlunparse(
         (scheme, parsed.netloc, path, "", urlencode(query), "")
     )
+
+
+def _plivo_stream_url(body: dict[str, Any]) -> str:
+    """Send media to Cloud when configured; otherwise retain local execution."""
+    import json
+
+    encoded = base64.b64encode(json.dumps(body).encode()).decode()
+    cloud_url = os.getenv("PIPECAT_CLOUD_PLIVO_WS_URL", "").strip()
+    if not cloud_url:
+        return _websocket_url(_required("PUBLIC_BASE_URL"), "/v1/plivo/ws", {"body": encoded})
+    parsed = urlparse(cloud_url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    if (
+        parsed.scheme != "wss"
+        or not parsed.hostname
+        or parsed.path != "/ws/plivo"
+        or not query.get("serviceHost")
+        or parsed.fragment
+        or parsed.username
+    ):
+        raise ValueError("PIPECAT_CLOUD_PLIVO_WS_URL must be a wss:// host /ws/plivo URL with serviceHost")
+    query["body"] = encoded
+    return urlunparse(parsed._replace(query=urlencode(query)))
 
 
 def _goodbox_prompt(data: dict[str, Any]) -> str:
@@ -267,39 +290,79 @@ class GoodboxApi:
         return data
 
     async def call_stop(
-        self, stream_id: str | None, voice_call_id: str | None, messages: list[dict[str, str]]
-    ) -> None:
-        payload = {
+        self,
+        stream_id: str | None,
+        voice_call_id: str | None,
+        messages: list[dict[str, str]],
+        *,
+        call_data: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Persist a transcript against the same provider call Goodbox started.
+
+        Older Goodbox deployments accepted only the three legacy fields below.
+        The extra, non-secret correlation fields let newer deployments resolve
+        the dashboard's voice-campaign record by Plivo call ID. If an older
+        deployment validates its schema strictly, retry its rejected 400/422
+        request once with the legacy payload so a compatibility issue cannot
+        discard a completed transcript.
+        """
+        legacy_payload = {
             "stream_id": stream_id,
             "voice_call_id": voice_call_id,
             "messages": messages,
             "inbox_key": os.getenv("GOODBOX_INBOX_KEY", "voice_standard_inbox"),
         }
+        payload = dict(legacy_payload)
+        correlation = {
+            key: (call_data or {}).get(key)
+            for key in ("call_id", "phone_id", "chatbot_id", "provider", "custom_variables")
+            if (call_data or {}).get(key) is not None
+        }
+        payload.update(correlation)
         logger.info(
-            "GOODBOX CALL STOP BEGIN | stream_id={} voice_call_id={} messages={}",
-            stream_id, voice_call_id, len(messages),
+            "GOODBOX CALL STOP BEGIN | stream_id={} voice_call_id={} call_id={} phone_id={} chatbot_id={} messages={}",
+            stream_id, voice_call_id, correlation.get("call_id"), correlation.get("phone_id"),
+            correlation.get("chatbot_id"), len(messages),
         )
         response = await self._client.post(f"{self._base_url}{CALL_STOP_PATH}", json=payload)
+        if correlation and response.status_code in {400, 422}:
+            logger.warning(
+                "GOODBOX CALL STOP CORRELATION REJECTED | status={} call_id={} retrying legacy payload",
+                response.status_code, correlation.get("call_id"),
+            )
+            response = await self._client.post(f"{self._base_url}{CALL_STOP_PATH}", json=legacy_payload)
         response.raise_for_status()
+        try:
+            response_body = response.json()
+        except ValueError:
+            response_body = {}
+        result = response_body.get("data") if isinstance(response_body, dict) else None
+        result = result if isinstance(result, dict) else {}
         role_counts = {
             role: sum(1 for item in messages if item.get("role") == role)
             for role in ("user", "assistant")
         }
         logger.info(
-            "GOODBOX CALL STOP | status={} stream_id={} voice_call_id={} messages={} user_messages={} assistant_messages={}",
+            "GOODBOX CALL STOP | status={} stream_id={} voice_call_id={} call_id={} messages={} user_messages={} assistant_messages={} response_id={} response_call_id={} response_voice_call_id={}",
             response.status_code,
             stream_id,
             voice_call_id,
+            correlation.get("call_id"),
             len(messages),
             role_counts["user"],
             role_counts["assistant"],
+            result.get("id"),
+            result.get("call_id"),
+            result.get("voice_call_id"),
         )
+        return result
 
 
 @dataclass
 class CallTranscript:
     stream_id: str | None
     voice_call_id: str | None
+    call_data: dict[str, Any] = field(default_factory=dict)
     messages: list[dict[str, str]] = field(default_factory=list)
 
     def add(self, role: str, content: str) -> None:
@@ -352,19 +415,16 @@ async def plivo_callback(
 ) -> Response:
     app.state.callback_count = getattr(app.state, "callback_count", 0) + 1
     logger.info("PLIVO CALLBACK | call_id={} phone_id={}", CallUUID, phone_id)
-    public_base_url = _required("PUBLIC_BASE_URL")
     body = {
         "phone_id": phone_id,
         "call_id": CallUUID,
         "from": From,
         "to": To,
         "provider": "plivo",
-        "chatbot_id": chatbot_id,
+        "chatbot_id": chatbot_id or os.getenv("GOODBOX_CHATBOT_ID"),
     }
-    import json
-
-    encoded = base64.urlsafe_b64encode(json.dumps(body).encode()).decode()
-    stream_url = _websocket_url(public_base_url, "/v1/plivo/ws", {"body": encoded})
+    stream_url = _plivo_stream_url(body)
+    logger.info("PLIVO XML | media_destination={}", "cloud" if os.getenv("PIPECAT_CLOUD_PLIVO_WS_URL", "").strip() else "local")
     xml = f"""<Response><Stream streamTimeout=\"3600\" keepCallAlive=\"true\" bidirectional=\"true\" contentType=\"audio/x-mulaw;rate=8000\">{escape(stream_url)}</Stream></Response>"""
     return Response(content=xml, media_type="application/xml")
 
@@ -403,6 +463,7 @@ async def plivo_media(websocket: WebSocket, body: str = Query("")) -> None:
             transcript = CallTranscript(
                 stream_id=call_data.get("stream_id"),
                 voice_call_id=config.get("voice_call_id"),
+                call_data=call_data,
             )
             serializer = PlivoFrameSerializer(
                 stream_id=call_data["stream_id"],
@@ -442,6 +503,7 @@ async def plivo_media(websocket: WebSocket, body: str = Query("")) -> None:
                             transcript.stream_id,
                             transcript.voice_call_id,
                             transcript.messages,
+                            call_data=transcript.call_data,
                         )
                     ),
                     timeout=15,

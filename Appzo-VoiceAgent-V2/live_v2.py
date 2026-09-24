@@ -6,6 +6,7 @@ letting stale or unvalidated speech become audible.
 """
 
 import asyncio
+import contextlib
 import os
 import re
 import time
@@ -44,7 +45,7 @@ from voice_agent.speech.speculative_cartesia import SpeculativeCartesiaBuffer
 from voice_agent.speech.stream_filter import SpeechStreamFilter
 from voice_agent.speech.booking_guard import BookingClaimGuard
 from voice_agent.turns.transcript_stability import TranscriptStabilityAnalyzer
-from voice_agent.turns.endpoint_profiles import profile_for_prompt
+from voice_agent.turns.endpoint_profiles import profile_for_prompt, detected_profile_for_prompt
 
 _LOW_INFO_FRAGMENTS = frozenset({
     "hiria", "very", "uh", "um", "ah", "hmm", "ha", "er", "oh", "huh",
@@ -152,6 +153,7 @@ class V2RoutingController(StreamingVoiceController):
         self._late_spec_tts_wait_secs = float(os.getenv("V2_LATE_SPEC_TTS_WAIT_MS", "400")) / 1000
         self._endpoint_profile = None
         self._endpoint_profile_updater = None
+        self._deferred_endpoint_profile: str | None = None
         self._prefix_buffer = ""
         self._enable_spec_tts = self.flags.enable_spec_tts
         self._spec_audio: SpeculativeCartesiaBuffer | None = None
@@ -314,9 +316,10 @@ class V2RoutingController(StreamingVoiceController):
             return
         state.latest_interim = interim
         if getattr(self, "_endpoint_profile", None) == "yes_no" and len(interim.strip().split()) >= 3:
-            self._endpoint_profile = "freeform"
-            if self._endpoint_profile_updater:
-                asyncio.create_task(self._endpoint_profile_updater("freeform"))
+            # Do not reconfigure Flux while this caller turn is active: its
+            # async Configure acknowledgement can otherwise race final EOT.
+            # Use freeform for the following listening turn instead.
+            self._deferred_endpoint_profile = "freeform"
         hypothesis = self._stability.update(interim)
         eager = self._flux_mode and self._flux_eager
         if eager:
@@ -374,7 +377,14 @@ class V2RoutingController(StreamingVoiceController):
             basis, slots=provisional_slots, pending_question=self.session.pending_question,
             current_facts=provisional_facts,
         )
-        if speech is not None or plan.risk_class not in {"LOW_PUBLIC", "LOW_WORKFLOW"} or plan.tool_name:
+        if speech is not None:
+            state.eager_deterministic_plan = plan
+            state.eager_deterministic_speech = speech
+            state.eager_deterministic_basis = basis
+            state.eager_deterministic_slots = provisional_slots
+            state.metrics.eager_deterministic_staged = True
+            return
+        if plan.risk_class not in {"LOW_PUBLIC", "LOW_WORKFLOW"} or plan.tool_name:
             return
         fingerprint = self._fingerprint(basis, plan, slots=provisional_slots)
         old = state.candidate
@@ -576,10 +586,22 @@ class V2RoutingController(StreamingVoiceController):
             self._transcript_callback("user", text)
 
         current_facts = facts.values if self.flags.enable_structured_facts else {}
-        plan, speech = self._response_plan(
-            text, slots=self.session.visible_facts(), pending_question=self.session.pending_question,
-            current_facts=current_facts,
-        )
+        if (
+            getattr(state, "eager_deterministic_speech", None) is not None
+            and text == getattr(state, "eager_deterministic_basis", None)
+        ):
+            plan = state.eager_deterministic_plan
+            speech = state.eager_deterministic_speech
+            state.metrics.eager_deterministic_hit = True
+            logger.debug(
+                "V2 EAGER DETERMINISTIC HIT turn={} route={} speech='{}'",
+                state.turn_id, plan.route, speech[:40],
+            )
+        else:
+            plan, speech = self._response_plan(
+                text, slots=self.session.visible_facts(), pending_question=self.session.pending_question,
+                current_facts=current_facts,
+            )
         state.metrics.decision_route = plan.route
         state.metrics.decision_intent = plan.intent_id or "unknown"
         state.metrics.decision_reason = plan.decision_reason
@@ -796,10 +818,16 @@ class V2RoutingController(StreamingVoiceController):
                 decision_reason="approved_knowledge_unavailable",
                 decision_confidence=.99,
             )
-            speech = (
-                "The available information doesn't confirm blue- or white-collar hiring support. "
-                "Our team can clarify that."
-            )
+            if "marketing" in set((current_facts or {}).get("roles") or ()):
+                speech = (
+                    "I've noted the marketing requirement. The available information doesn't confirm "
+                    "blue- or white-collar hiring support. Our team can clarify that."
+                )
+            else:
+                speech = (
+                    "The available information doesn't confirm blue- or white-collar hiring support. "
+                    "Our team can clarify that."
+                )
 
         callback_day = str((current_facts or {}).get("callback_day") or "").strip()
         callback_time = str((current_facts or {}).get("callback_time") or "").strip()
@@ -966,6 +994,8 @@ class V2RoutingController(StreamingVoiceController):
         parts: list[str] = []
         speech_chunk_count = 0
         last_safe_chunk_at: float | None = None
+        chunk_lock = asyncio.Lock()
+        deadline_task: asyncio.Task | None = None
 
         async def emit_safe(chunk: str) -> None:
             nonlocal started, speech_chunk_count, last_safe_chunk_at
@@ -1063,6 +1093,38 @@ class V2RoutingController(StreamingVoiceController):
                 state.metrics.tts_requested_at = time.perf_counter()
             await self.push_frame(LLMTextFrame(self._tts_delta(request, chunk)))
             request.normal_tts_text_sent = True
+
+        def schedule_chunk_deadline() -> None:
+            """Arm a real wall-clock flush for a paused streamed response."""
+            nonlocal deadline_task
+            if deadline_task is not None and not deadline_task.done():
+                return
+            token_at = chunker.first_token_at
+            if token_at is None:
+                return
+
+            async def flush_when_due(expected_token_at: float) -> None:
+                try:
+                    await asyncio.sleep(self._safe_chunk_max_wait_ms / 1000)
+                    async with chunk_lock:
+                        if request.terminal or chunker.first_token_at != expected_token_at:
+                            return
+                        due = chunker.release_due()
+                    for safe in due:
+                        await emit_safe(safe)
+                except asyncio.CancelledError:
+                    raise
+
+            deadline_task = asyncio.create_task(
+                flush_when_due(token_at), name=f"v2-safe-chunk-deadline-{state.turn_id}"
+            )
+
+        async def push_safe_text(clean: str) -> None:
+            async with chunk_lock:
+                safe_chunks = chunker.push(clean)
+                schedule_chunk_deadline()
+            for safe in safe_chunks:
+                await emit_safe(safe)
 
         try:
             if state.metrics.speculative_started_at is None:
@@ -1173,8 +1235,7 @@ class V2RoutingController(StreamingVoiceController):
                                     2,
                                 )
                         parts.append(clean)
-                        for safe in chunker.push(clean):
-                            await emit_safe(safe)
+                        await push_safe_text(clean)
                 filtered_tail = speech_filter.push("", final=True)
                 tail = booking_guard.push(filtered_tail, final=True) if booking_guard else filtered_tail
                 if tail:
@@ -1186,9 +1247,10 @@ class V2RoutingController(StreamingVoiceController):
                                 2,
                             )
                     parts.append(tail)
-                    for safe in chunker.push(tail):
-                        await emit_safe(safe)
-                for safe in chunker.flush():
+                    await push_safe_text(tail)
+                async with chunk_lock:
+                    final_chunks = chunker.flush()
+                for safe in final_chunks:
                     await emit_safe(safe)
 
             speech = "".join(parts).strip()
@@ -1213,6 +1275,10 @@ class V2RoutingController(StreamingVoiceController):
                 state.metrics.route = "v2-error"
                 await self._speak_fixed(state, self._refusal_message if code == "content_filter" else self._operational_error_message)
         finally:
+            if deadline_task is not None and not deadline_task.done():
+                deadline_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await deadline_task
             if stream is not None:
                 await stream.close()
 
@@ -1410,7 +1476,14 @@ class V2RoutingController(StreamingVoiceController):
         state_name = str(self.session.state.get("name", "OPEN"))
         states = self.session.agent.flow_graph.get("states") or {}
         state_config = states.get(state_name, {}) if isinstance(states, dict) else {}
-        name = str(state_config.get("endpoint_profile") or profile_for_prompt(speech))
+        prompt_profile = detected_profile_for_prompt(speech) if speech else None
+        name = str(
+            self._deferred_endpoint_profile
+            or prompt_profile
+            or state_config.get("endpoint_profile")
+            or "freeform"
+        )
+        self._deferred_endpoint_profile = None
         if name == "yes_no" and self.session.pending_question and self.session.pending_question.expected_type not in {"boolean", "yes_no"}:
             name = "freeform"
         stt_profile = self.session.agent.stt_profile or {}

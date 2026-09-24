@@ -22,11 +22,12 @@ from voice_agent.agents.bundle import AgentBundle
 from voice_agent.agents.compiler import AgentCompiler
 from voice_agent.agents.registry import AgentBundleRegistry
 from voice_agent.flows.callbacks import CallbackCoordinator
-from voice_agent.flows.facts import FactExtractor
+from voice_agent.flows.facts import FactExtractor, NumericRange
 from voice_agent.llm.prompt_builder import PromptBuilder
 from voice_agent.routing.deterministic import DeterministicRouter
 from voice_agent.runtime.bootstrap import RuntimeBootstrap
 from voice_agent.runtime.flags import RuntimeFlags
+from voice_agent.runtime.intents import CanonicalIntentModel
 from voice_agent.runtime.latency_breakdown import LatencyBreakdown
 from voice_agent.runtime.response_plan import ResponsePlan
 from voice_agent.speech.greeting_cache import (
@@ -81,6 +82,23 @@ class ImprovementUnitTests(unittest.TestCase):
             chunker.push("We can discuss your hiring plans.", now=1.0),
             ["We can discuss your hiring plans."],
         )
+
+    def test_safe_chunker_wall_clock_release_does_not_need_another_token(self):
+        chunker = SafeSpeechChunker(min_chars=20, min_words=3, max_wait_ms=60)
+        self.assertEqual(chunker.push("We can discuss your hiring", now=1.0), [])
+        self.assertEqual(chunker.release_due(now=1.061), ["We can discuss your hiring"])
+
+    def test_pricing_intent_wins_over_model_identity(self):
+        match = CanonicalIntentModel().classify("What's your pricing model?")
+        self.assertEqual(match.intent_id, "faq_pricing")
+
+    def test_role_local_counts_cover_operations_and_transcribed_ranges(self):
+        facts = FactExtractor().extract(
+            "three four people for my tech department and a couple of people for my operations department",
+            {},
+        ).values
+        self.assertEqual(facts["headcount_by_role"]["technology"], NumericRange(3, 4, "people", True))
+        self.assertEqual(facts["headcount_by_role"]["operations"], 2)
 
     def test_booking_guard_blocks_unverified_connect_and_meeting_claims(self):
         guard = BookingClaimGuard()

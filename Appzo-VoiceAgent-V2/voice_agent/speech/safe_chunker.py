@@ -45,6 +45,35 @@ class SafeSpeechChunker:
         text, self.buffer, self.first_token_at = self.buffer.strip(), "", None
         return [text] if text else []
 
+    def release_due(self, now: float | None = None) -> list[str]:
+        """Release a phrase-sized pending chunk when its wall-clock wait expires.
+
+        Upstream token arrival normally drives ``push``. This method lets a
+        caller flush a speakable pending phrase even when the model pauses and
+        no further token arrives to trigger that check.
+        """
+        now = time.perf_counter() if now is None else now
+        if not self.buffer or self.first_token_at is None:
+            return []
+        if (now - self.first_token_at) * 1000 < self.max_wait_ms:
+            return []
+        if self._unsafe_tail() or self._ends_in_negation():
+            return []
+        enough = len(self.buffer) >= self.min_chars or len(self.buffer.split()) >= self.min_words
+        if not enough:
+            return []
+        # At a true wall-clock deadline, retain the final token as well. Token
+        # deltas are usually word fragments, but dropping it can turn a sound
+        # clause ("discuss your hiring") into an awkward one ("discuss your").
+        # Numeric / negation tails remain guarded above.
+        boundary = self._last_boundary() or len(self.buffer)
+        if not boundary or self._unsafe_tail(boundary):
+            return []
+        candidate = self.buffer[:boundary].strip()
+        if len(candidate) < self.min_chars and len(candidate.split()) < self.min_words:
+            return []
+        return [self._pop(boundary)]
+
     def _last_boundary(self) -> int:
         # A provider commonly ends a streamed delta immediately after the
         # period. Treat it as a valid boundary even before the following
