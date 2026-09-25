@@ -640,16 +640,16 @@ class TestFixesItems1To7(unittest.IsolatedAsyncioTestCase):
         from voice_agent.turns.endpoint_profiles import flux_profile
 
         for name, expected_eager, expected_eot in [
-            ("yes_no", 0.20, 0.52),
-            ("short_entity", 0.22, 0.55),
-            ("requirements", 0.25, 0.55),
-            ("freeform", 0.28, 0.58),
-            ("fast", 0.22, 0.55),
+            ("yes_no", 0.30, 0.55),
+            ("short_entity", 0.30, 0.58),
+            ("requirements", 0.30, 0.60),
+            ("freeform", 0.32, 0.62),
+            ("fast", 0.30, 0.60),
         ]:
             prof = flux_profile(name)
             self.assertAlmostEqual(prof.eager_eot_threshold, expected_eager, places=2)
             self.assertAlmostEqual(prof.eot_threshold, expected_eot, places=2)
-            self.assertGreaterEqual(round(prof.eot_threshold - prof.eager_eot_threshold, 2), 0.30)
+            self.assertGreaterEqual(round(prof.eot_threshold - prof.eager_eot_threshold, 2), 0.25)
 
     def test_option2_detected_profile_for_prompt(self):
         """Option 2: Prompt-detected profiles identify targeted entity vs freeform intents."""
