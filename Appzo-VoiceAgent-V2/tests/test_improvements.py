@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import struct
 import tempfile
 import unittest
@@ -468,6 +469,23 @@ class ImprovementAsyncTests(unittest.IsolatedAsyncioTestCase):
         events = [call.args[0].message["event"] for call in output.send_message.await_args_list]
         self.assertEqual(events.count("clearAudio"), 1)
 
+    def test_flux_profile_custom_env_overrides(self):
+        from voice_agent.turns.endpoint_profiles import flux_profile
+        with patch.dict(os.environ, {"V2_FLUX_FAST_EAGER": "0.33", "V2_FLUX_FAST_TIMEOUT_MS": "950"}):
+            prof = flux_profile("fast")
+            self.assertEqual(prof.eager_eot_threshold, 0.33)
+            self.assertEqual(prof.eot_timeout_ms, 950)
+
+    def test_goodbox_clean_prompt_bypass(self):
+        from goodbox_server import _goodbox_prompt
+        with patch.dict(os.environ, {"V2_BYPASS_GOODBOX_PROMPT": "true"}):
+            prompt = _goodbox_prompt({"system_prompt": "bloated prompt", "prompt": "legacy"})
+            self.assertNotIn("OK|", prompt)
+            self.assertNotIn("END|", prompt)
+            self.assertNotIn("V1 LANGUAGE OVERRIDE", prompt)
+            self.assertIn("Riya", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -60,7 +60,15 @@ LATENCY_TEST_FLUX_PROFILES = {
 def flux_profile(name: str) -> FluxEndpointProfile:
     preset = os.getenv("V2_ENDPOINT_PROFILE_PRESET", "current").lower()
     profiles = LATENCY_TEST_FLUX_PROFILES if preset == "latency_test" else FLUX_PROFILES
-    return profiles.get(name.casefold(), profiles["fast"])
+    profile = profiles.get(name.casefold(), profiles["fast"])
+    p_name = name.upper()
+    eager_env = os.getenv(f"V2_FLUX_{p_name}_EAGER")
+    eot_env = os.getenv(f"V2_FLUX_{p_name}_EOT")
+    timeout_env = os.getenv(f"V2_FLUX_{p_name}_TIMEOUT_MS")
+    eager = max(0.30, float(eager_env)) if eager_env else profile.eager_eot_threshold
+    eot = max(0.50, float(eot_env)) if eot_env else profile.eot_threshold
+    timeout_ms = int(timeout_env) if timeout_env else profile.eot_timeout_ms
+    return FluxEndpointProfile(eager_eot_threshold=eager, eot_threshold=eot, eot_timeout_ms=timeout_ms)
 
 
 def detected_profile_for_prompt(text: str) -> str | None:
