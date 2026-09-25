@@ -1190,10 +1190,13 @@ class V2RoutingController(StreamingVoiceController):
                     self.prompt_builder._safe_json_dumps(diagnostics.get("retrieval", [])),
                 )
             async with asyncio.timeout(20):
+                await self.start_ttfb_metrics()
+                native_ttfb_pending = True
                 stream = await self._client.chat.completions.create(
                     model=self._model,
                     messages=messages,
                     stream=True,
+                    stream_options={"include_usage": True},
                     temperature=0,
                     max_completion_tokens=self._llm_max_tokens,
                 )
@@ -1202,10 +1205,14 @@ class V2RoutingController(StreamingVoiceController):
                 async for item in stream:
                     if self._state is not state or request.terminal:
                         return
+                    await self._report_provider_usage(item)
                     choice = item.choices[0] if item.choices else None
                     content = getattr(getattr(choice, "delta", None), "content", None)
                     if not content:
                         continue
+                    if native_ttfb_pending:
+                        await self.stop_ttfb_metrics()
+                        native_ttfb_pending = False
                     if state.metrics.llm_first_token_at is None:
                         state.metrics.llm_first_token_at = time.perf_counter()
                         ttft_ms = round(

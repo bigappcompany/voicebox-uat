@@ -21,6 +21,7 @@ from pipecat.frames.frames import (
     LLMTextFrame,
     TTSAudioRawFrame,
 )
+from pipecat.services.llm_service import LLMService
 
 
 class FakeStream:
@@ -32,6 +33,22 @@ class FakeStream:
     async def chunks(self):
         for content in self.text:
             yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=content))])
+
+
+class UsageStream(FakeStream):
+    async def chunks(self):
+        async for chunk in super().chunks():
+            yield chunk
+        yield SimpleNamespace(
+            choices=[],
+            usage=SimpleNamespace(
+                prompt_tokens=101,
+                completion_tokens=7,
+                total_tokens=108,
+                prompt_tokens_details=SimpleNamespace(cached_tokens=13),
+                completion_tokens_details=SimpleNamespace(reasoning_tokens=0),
+            ),
+        )
 
 
 class LiveRoutingTests(unittest.IsolatedAsyncioTestCase):
@@ -71,6 +88,30 @@ class LiveRoutingTests(unittest.IsolatedAsyncioTestCase):
         if state.final_request:
             await state.final_request.task
         return state
+
+    async def test_controller_is_native_pipecat_llm_service(self):
+        self.assertIsInstance(self.controller, LLMService)
+        self.assertTrue(self.controller.can_generate_metrics())
+        self.assertEqual(self.controller._settings.model, self.controller._model)
+
+    async def test_hosted_stream_emits_native_ttfb_and_usage_metrics(self):
+        self.controller.start_ttfb_metrics = AsyncMock()
+        self.controller.stop_ttfb_metrics = AsyncMock()
+        self.controller.start_llm_usage_metrics = AsyncMock()
+        self.client.chat.completions.create.return_value = UsageStream(["We can help with that."])
+
+        await self.answer("do not end the call")
+
+        kwargs = self.client.chat.completions.create.await_args.kwargs
+        self.assertEqual(kwargs["stream_options"], {"include_usage": True})
+        self.controller.start_ttfb_metrics.assert_awaited_once()
+        self.controller.stop_ttfb_metrics.assert_awaited_once()
+        self.controller.start_llm_usage_metrics.assert_awaited_once()
+        usage = self.controller.start_llm_usage_metrics.await_args.args[0]
+        self.assertEqual(usage.prompt_tokens, 101)
+        self.assertEqual(usage.completion_tokens, 7)
+        self.assertEqual(usage.total_tokens, 108)
+        self.assertEqual(usage.cache_read_input_tokens, 13)
 
     async def test_goodbye_speaks_then_ends_without_llm(self):
         state = await self.answer("goodbye")
