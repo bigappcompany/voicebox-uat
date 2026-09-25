@@ -34,6 +34,7 @@ from pipecat.frames.frames import (
     UserStoppedSpeakingFrame,
 )
 from pipecat.observers.base_observer import BaseObserver, FrameProcessed, FramePushed
+from pipecat.metrics.metrics import LLMTokenUsage
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -50,6 +51,8 @@ from pipecat.runner.types import RunnerArguments
 from pipecat.services.cartesia.tts import CartesiaTTSService, GenerationConfig
 from pipecat.services.deepgram.flux.stt import DeepgramFluxSTTService
 from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.llm_service import LLMService
+from pipecat.services.settings import LLMSettings
 from pipecat.services.tts_service import TextAggregationMode
 from pipecat.transcriptions.language import Language
 from pipecat.transports.base_transport import BaseTransport
@@ -226,8 +229,13 @@ class TurnState:
     final_wait_task: asyncio.Task | None = None
 
 
-class StreamingVoiceController(FrameProcessor):
-    """Goodbox-configured voice controller shared by the V1 rollback and V2 router."""
+class StreamingVoiceController(LLMService):
+    """Pipecat LLM service shared by the V1 rollback and optimized V2 router.
+
+    The controller still owns routing, speculation, filtering, and response
+    release. Inheriting from ``LLMService`` makes the existing hosted branch a
+    first-class Pipecat service without inserting another inference hop.
+    """
 
     _VOICE_LEVEL = int(os.getenv("V2_INPUT_VOICE_RMS", "200"))
 
@@ -245,7 +253,22 @@ class StreamingVoiceController(FrameProcessor):
         operational_error_message: str = OPERATIONAL_ERROR,
         owns_llm_client: bool = True,
     ) -> None:
-        super().__init__(name="StreamingVoiceController")
+        super().__init__(
+            name=type(self).__name__,
+            settings=LLMSettings(
+                model=model,
+                system_instruction=system_prompt,
+                temperature=0,
+                max_tokens=max_tokens,
+                top_p=None,
+                top_k=None,
+                frequency_penalty=None,
+                presence_penalty=None,
+                seed=None,
+                filter_incomplete_user_turns=False,
+                user_turn_completion_config=None,
+            ),
+        )
         self._client = client or AsyncOpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
         self._owns_llm_client = owns_llm_client if client is not None else True
         self._model = model
@@ -261,6 +284,32 @@ class StreamingVoiceController(FrameProcessor):
         self._metrics_by_turn: dict[int, TurnMetrics] = {}
         self._latency_observer: Any | None = None
         self._latest_voiced_audio_at: float | None = None
+
+    def can_generate_metrics(self) -> bool:
+        """Expose hosted generation metrics to Pipecat Cloud."""
+        return True
+
+    async def _report_provider_usage(self, chunk) -> None:
+        """Convert an OpenAI-compatible stream usage chunk to Pipecat metrics."""
+        usage = getattr(chunk, "usage", None)
+        if usage is None:
+            return
+        prompt_details = getattr(usage, "prompt_tokens_details", None)
+        completion_details = getattr(usage, "completion_tokens_details", None)
+        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+        total_tokens = int(
+            getattr(usage, "total_tokens", None) or (prompt_tokens + completion_tokens)
+        )
+        await self.start_llm_usage_metrics(
+            LLMTokenUsage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                cache_read_input_tokens=getattr(prompt_details, "cached_tokens", None),
+                reasoning_tokens=getattr(completion_details, "reasoning_tokens", None),
+            )
+        )
 
     @property
     def metrics_by_turn(self) -> dict[int, TurnMetrics]:
@@ -482,6 +531,7 @@ class StreamingVoiceController(FrameProcessor):
                 model=self._model,
                 messages=messages,
                 stream=True,
+                stream_options={"include_usage": True},
                 temperature=0,
                 max_completion_tokens=self._llm_max_tokens,
             )
@@ -491,10 +541,13 @@ class StreamingVoiceController(FrameProcessor):
                     "reasoning_effort": "low",
                     "include_reasoning": False,
                 }
+            await self.start_ttfb_metrics()
+            native_ttfb_pending = True
             stream = await asyncio.wait_for(self._client.chat.completions.create(**request_kwargs), timeout=15)
             async for chunk in stream:
                 if self._state is not state or request.terminal:
                     return
+                await self._report_provider_usage(chunk)
                 # Azure may include content-filter/usage metadata chunks with a
                 # Choice but no Delta. They are valid stream events, not an LLM
                 # failure, and contain no text for TTS.
@@ -503,6 +556,9 @@ class StreamingVoiceController(FrameProcessor):
                 text = getattr(delta, "content", None)
                 if not text:
                     continue
+                if native_ttfb_pending:
+                    await self.stop_ttfb_metrics()
+                    native_ttfb_pending = False
                 if state.metrics.llm_first_token_at is None:
                     logger.info("LLM first token turn={}", state.turn_id)
                     state.metrics.llm_first_token_at = time.perf_counter()
