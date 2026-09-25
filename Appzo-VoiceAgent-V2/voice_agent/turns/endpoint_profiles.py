@@ -33,27 +33,27 @@ FLUX_PROFILES = {
     "balanced": FluxEndpointProfile(.55, .70, 3000),
     # The default sales-call profile favours responsiveness while retaining a
     # timeout long enough for short natural pauses.
-    "fast": FluxEndpointProfile(.22, .55, 1200),
-    # yes_no: caller gave a simple yes/no; eager fires on initial cadence inflection (.20),
-    # hard EOT secures high-confidence confirmation (.52).
-    "yes_no": FluxEndpointProfile(.20, .52, 500),
-    # short_entity: name / date / time — 150ms eager lead for TTS pre-warming.
-    "short_entity": FluxEndpointProfile(.22, .55, 750),
+    "fast": FluxEndpointProfile(.30, .60, 1200),
+    # yes_no: caller gave a simple yes/no; eager fires at Deepgram minimum (.30),
+    # hard EOT secures high-confidence confirmation (.55).
+    "yes_no": FluxEndpointProfile(.30, .55, 500),
+    # short_entity: name / date / time — 280ms eager lead for TTS pre-warming.
+    "short_entity": FluxEndpointProfile(.30, .58, 750),
     # requirements: caller listing roles / headcount — needs a longer window to
-    # complete a sentence, but wider eager gap allows background candidate generation.
-    "requirements": FluxEndpointProfile(.25, .55, 1000),
+    # complete a sentence, but 300ms eager gap allows background candidate generation.
+    "requirements": FluxEndpointProfile(.30, .60, 1000),
     # freeform: open-ended answer — match old requirements timeout so we don't
-    # cut off mid-sentence while eager at .28 gives early speculation start.
-    "freeform": FluxEndpointProfile(.28, .58, 1400),
+    # cut off mid-sentence while eager at .32 gives early speculation start.
+    "freeform": FluxEndpointProfile(.32, .62, 1400),
 }
 
 LATENCY_TEST_FLUX_PROFILES = {
     "balanced": FluxEndpointProfile(.55, .70, 3000),
-    "fast": FluxEndpointProfile(.22, .55, 1200),
-    "yes_no": FluxEndpointProfile(.20, .52, 400),
-    "short_entity": FluxEndpointProfile(.22, .55, 550),
-    "requirements": FluxEndpointProfile(.25, .55, 750),
-    "freeform": FluxEndpointProfile(.28, .58, 1100),
+    "fast": FluxEndpointProfile(.30, .60, 1200),
+    "yes_no": FluxEndpointProfile(.30, .55, 400),
+    "short_entity": FluxEndpointProfile(.30, .58, 550),
+    "requirements": FluxEndpointProfile(.30, .60, 750),
+    "freeform": FluxEndpointProfile(.32, .62, 1100),
 }
 
 

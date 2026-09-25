@@ -14,8 +14,8 @@ class FluxOrderingTests(unittest.IsolatedAsyncioTestCase):
     async def test_endpoint_profile_can_update_without_reconnect(self):
         stt = OrderedFluxSTTService(api_key="test")
         await stt.configure_endpoint(flux_profile("yes_no"))
-        self.assertEqual(stt._settings.eager_eot_threshold, .20)
-        self.assertEqual(stt._settings.eot_threshold, .52)
+        self.assertEqual(stt._settings.eager_eot_threshold, .30)
+        self.assertEqual(stt._settings.eot_threshold, .55)
         self.assertEqual(stt._settings.eot_timeout_ms, 500)
 
     async def test_real_aggregator_delivers_complete_text_before_shutdown(self):

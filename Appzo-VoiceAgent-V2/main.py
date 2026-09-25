@@ -1464,8 +1464,8 @@ async def run_bot(
             settings=DeepgramFluxSTTService.Settings(
                 model=runtime.stt_model,
                 language_hints=language_hints,
-                eager_eot_threshold=float(os.getenv("V2_FLUX_EAGER_EOT_THRESHOLD", str(endpoint_profile.eager_eot_threshold))),
-                eot_threshold=float(os.getenv("V2_FLUX_EOT_THRESHOLD", str(endpoint_profile.eot_threshold))),
+                eager_eot_threshold=max(0.30, float(os.getenv("V2_FLUX_EAGER_EOT_THRESHOLD", str(endpoint_profile.eager_eot_threshold)))),
+                eot_threshold=max(0.50, float(os.getenv("V2_FLUX_EOT_THRESHOLD", str(endpoint_profile.eot_threshold)))),
                 eot_timeout_ms=int(os.getenv("V2_FLUX_EOT_TIMEOUT_MS", str(endpoint_profile.eot_timeout_ms))),
                 keyterm=keyterms,
             ),
