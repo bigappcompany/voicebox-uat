@@ -19,6 +19,7 @@ from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 from goodbox_server import (
     CallTranscript,
     GoodboxApi,
+    _clean_voice_prompt,
     _runtime_from_goodbox,
     v2_bootstrap,
 )
@@ -79,6 +80,9 @@ async def bot(runner_args: RunnerArguments) -> None:
     transcript: CallTranscript | None = None
     try:
         config = await goodbox.call_start(call_data)
+        if os.getenv("V2_BYPASS_GOODBOX_PROMPT", "true").lower() == "true":
+            config = dict(config)
+            config["runtime_prompt"] = {"invariant": _clean_voice_prompt()}
         v2_controller = await v2_bootstrap.start_call(call_data, config)
         transcript = CallTranscript(
             stream_id=call_data.get("stream_id"),

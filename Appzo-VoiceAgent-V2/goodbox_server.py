@@ -118,8 +118,26 @@ def _plivo_stream_url(body: dict[str, Any]) -> str:
     return urlunparse(parsed._replace(query=urlencode(query)))
 
 
+DEFAULT_VOICE_PROMPT = """You are Riya, a warm, professional Talent Acquisition consultant calling from The Hiring Company.
+Your goal is to understand the caller's hiring requirements and staffing plans.
+Voice Guidelines:
+- Speak in a natural, friendly, conversational voice tone suitable for a phone call.
+- Keep responses concise (1 to 2 spoken sentences).
+- Support English, Hindi, and natural Hinglish seamlessly, matching the caller's spoken language.
+- Speak directly as the assistant. Never output markdown, bullet points, asterisks, control tokens, or wire prefixes.
+- Directly answer questions before asking any follow-up question.
+"""
+
+
+def _clean_voice_prompt() -> str:
+    return os.getenv("V2_SYSTEM_PROMPT", "").strip() or DEFAULT_VOICE_PROMPT
+
+
 def _goodbox_prompt(data: dict[str, Any]) -> str:
-    """Preserve Goodbox instructions while adding the controller's wire format."""
+    """Return clean voice prompt when bypass is enabled; otherwise preserve legacy wire format."""
+    if os.getenv("V2_BYPASS_GOODBOX_PROMPT", "true").lower() == "true":
+        return _clean_voice_prompt()
+
     parts = [
         str(data.get("system_prompt") or "").strip(),
         str(data.get("prompt") or "").strip(),
@@ -448,6 +466,9 @@ async def plivo_media(websocket: WebSocket, body: str = Query("")) -> None:
         goodbox = GoodboxApi()
         try:
             config = await goodbox.call_start(call_data)
+            if os.getenv("V2_BYPASS_GOODBOX_PROMPT", "true").lower() == "true":
+                config = dict(config)
+                config["runtime_prompt"] = {"invariant": _clean_voice_prompt()}
             # Compile authoring configuration at call setup. The existing V1
             # Pipecat controller remains the feature-flagged rollback path;
             # no Goodbox lookup occurs after this point in the media turn path.
