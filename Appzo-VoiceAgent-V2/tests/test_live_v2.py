@@ -93,6 +93,17 @@ class LiveRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(self.controller, LLMService)
         self.assertTrue(self.controller.can_generate_metrics())
         self.assertEqual(self.controller._settings.model, self.controller._model)
+        self.assertRegex(self.controller.name, r"^V2RoutingController#\d+$")
+        self.assertEqual(self.controller.service_metadata_frame().service_name, self.controller.name)
+
+    async def test_deterministic_response_has_no_llm_metrics(self):
+        self.controller.start_ttfb_metrics = AsyncMock()
+        self.controller.stop_ttfb_metrics = AsyncMock()
+        self.controller.start_llm_usage_metrics = AsyncMock()
+        await self.answer("office hours")
+        self.controller.start_ttfb_metrics.assert_not_awaited()
+        self.controller.stop_ttfb_metrics.assert_not_awaited()
+        self.controller.start_llm_usage_metrics.assert_not_awaited()
 
     async def test_hosted_stream_emits_native_ttfb_and_usage_metrics(self):
         self.controller.start_ttfb_metrics = AsyncMock()

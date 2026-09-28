@@ -64,7 +64,7 @@ from pipecat.workers.runner import WorkerRunner
 from websockets.asyncio.client import connect as websocket_connect
 
 from voice_agent.runtime.latency_breakdown import LatencyBreakdown
-from voice_agent.runtime.telemetry import SessionTelemetryReport, TelemetryBoundaryFilter, cloud_rtvi_params
+from voice_agent.runtime.telemetry import CloudTelemetryProcessor, SessionTelemetryReport, TelemetryBoundaryFilter, cloud_rtvi_params
 
 
 load_dotenv()
@@ -256,9 +256,7 @@ class StreamingVoiceController(LLMService):
         owns_llm_client: bool = True,
     ) -> None:
         super().__init__(
-            # Keep service metadata and metric processor IDs identical and
-            # explicitly identify this custom controller as an LLM service.
-            name=f"{type(self).__name__}LLMService",
+            # Use Pipecat's unique default identity for metadata and metrics.
             settings=LLMSettings(
                 model=model,
                 system_instruction=system_prompt,
@@ -1310,7 +1308,7 @@ async def run_bot(
         endpoint_profile_preset,
         tts_buffer_ms,
     )
-    rtvi_processor = RTVIProcessor()
+    rtvi_processor = CloudTelemetryProcessor() if cloud_telemetry else RTVIProcessor()
 
     async def publish_conversation_answer(text: str) -> None:
         await rtvi_processor.push_transport_message(
