@@ -1,8 +1,12 @@
 import asyncio
 import json
+import math
 import os
 import time
 from dataclasses import dataclass
+
+from loguru import logger
+from voice_agent.runtime.telemetry import TelemetrySpeechStartedFrame, TelemetrySpeechStoppedFrame
 
 from pipecat.frames.frames import DataFrame
 from pipecat.services.deepgram.flux.stt import DeepgramFluxSTTService
@@ -16,8 +20,12 @@ class FluxResumeFrame(DataFrame):
 
 
 class OrderedFluxSTTService(DeepgramFluxSTTService):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, telemetry_enabled=False, **kwargs):
         super().__init__(*args, **kwargs)
+        # Enabled only when paired with TelemetryBoundaryFilter by main.py.
+        self._telemetry_enabled = telemetry_enabled
+        self._telemetry_last_voice_at = None
+        self._telemetry_voice_level = int(os.getenv("V2_INPUT_VOICE_RMS", "200"))
         self._input_gap_threshold_secs = float(os.getenv("V2_INPUT_PACKET_GAP_MS", "100")) / 1000
         self._last_input_at = None
         self._input_gap_count = 0
@@ -54,6 +62,11 @@ class OrderedFluxSTTService(DeepgramFluxSTTService):
 
     async def run_stt(self, audio):
         now = time.perf_counter()
+        if self._telemetry_enabled and len(audio) >= 2:
+            samples = memoryview(audio[:len(audio) - len(audio) % 2]).cast("h")
+            rms = math.sqrt(sum(int(s) * int(s) for s in samples) / len(samples))
+            if rms >= self._telemetry_voice_level:
+                self._telemetry_last_voice_at = now
         if self._last_input_at is not None:
             gap = max(0.0, now - self._last_input_at)
             if gap >= self._input_gap_threshold_secs:
@@ -63,10 +76,37 @@ class OrderedFluxSTTService(DeepgramFluxSTTService):
         async for frame in super().run_stt(audio):
             yield frame
 
+    async def _handle_start_of_turn(self, transcript):
+        if self._telemetry_enabled:
+            await self._emit_speech_telemetry(start=True)
+        await super()._handle_start_of_turn(transcript)
+
+    async def _emit_speech_telemetry(self, *, start=False, ended_at=None):
+        # Do not let instrumentation failure abort a real user turn.
+        try:
+            if start:
+                await self.push_frame(TelemetrySpeechStartedFrame())
+                return
+            last_voice = self._telemetry_last_voice_at
+            if last_voice is None or last_voice > ended_at:
+                logger.debug("FLUX TELEMETRY | missing valid PCM speech-end timestamp")
+                return
+            delay = ended_at - last_voice
+            epoch_end = time.time()
+            await self.push_frame(TelemetrySpeechStoppedFrame(timestamp=epoch_end, stop_secs=delay))
+            # Pipecat displays this under STT TTFB. Its precise meaning here is
+            # last voiced PCM received -> Flux final EOT received, including
+            # endpointing. It is NOT eager-EOT -> hard-EOT or pure inference.
+            await self.start_ttfb_metrics(start_time=epoch_end - delay)
+            await self.stop_ttfb_metrics(end_time=epoch_end)
+        except Exception as exc:
+            logger.warning("FLUX TELEMETRY FAILED | {}", type(exc).__name__)
+
     async def _handle_end_of_turn(self, transcript, data):
+        ended_at = time.perf_counter()
         data = dict(
             data,
-            runtime_eot_at=time.perf_counter(),
+            runtime_eot_at=ended_at,
             runtime_input_gap_count=self._input_gap_count,
             runtime_input_gap_max_ms=round(self._input_gap_max_ms, 1),
             runtime_turn_resumed_count=self._turn_resumed_count,
@@ -74,6 +114,9 @@ class OrderedFluxSTTService(DeepgramFluxSTTService):
         self._input_gap_count = 0
         self._input_gap_max_ms = 0.0
         self._turn_resumed_count = 0
+        if self._telemetry_enabled:
+            await self._emit_speech_telemetry(ended_at=ended_at)
+            self._telemetry_last_voice_at = None
         await super()._handle_end_of_turn(transcript, data)
 
     async def _handle_eager_end_of_turn(self, transcript, data):

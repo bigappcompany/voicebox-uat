@@ -34,6 +34,7 @@ from pipecat.frames.frames import (
     UserStoppedSpeakingFrame,
 )
 from pipecat.observers.base_observer import BaseObserver, FrameProcessed, FramePushed
+from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.metrics.metrics import LLMTokenUsage
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
@@ -63,6 +64,7 @@ from pipecat.workers.runner import WorkerRunner
 from websockets.asyncio.client import connect as websocket_connect
 
 from voice_agent.runtime.latency_breakdown import LatencyBreakdown
+from voice_agent.runtime.telemetry import SessionTelemetryReport, TelemetryBoundaryFilter, cloud_rtvi_params
 
 
 load_dotenv()
@@ -254,7 +256,9 @@ class StreamingVoiceController(LLMService):
         owns_llm_client: bool = True,
     ) -> None:
         super().__init__(
-            name=type(self).__name__,
+            # Keep service metadata and metric processor IDs identical and
+            # explicitly identify this custom controller as an LLM service.
+            name=f"{type(self).__name__}LLMService",
             settings=LLMSettings(
                 model=model,
                 system_instruction=system_prompt,
@@ -702,16 +706,17 @@ class LiveLatencyObserver(BaseObserver):
         tts_transport: str,
         session=None,
         call_origin_at: float | None = None,
+        telemetry_report=None,
     ) -> None:
         super().__init__()
-        # Pipecat 1.7.0 has BaseObserver hooks but no packaged latency
-        # observer/event. Expose the requested event contract on our custom
-        # observer so applications can consume LatencyBreakdown objects.
+        # Keep our PCM-based measurement alongside Cloud's native
+        # UserBotLatencyObserver (which ends at BotStartedSpeakingFrame).
         self._register_event_handler("on_latency_breakdown", sync=True)
         self._controller = controller
         self._tts_transport = tts_transport
         self._session = session
         self._call_origin_at = call_origin_at
+        self._telemetry_report = telemetry_report
         self._seen: set[int] = set()
         self._reported_turn_ids: set[int] = set()
         self._reporting_turn_ids: set[int] = set()
@@ -954,7 +959,10 @@ class LiveLatencyObserver(BaseObserver):
                     metrics.turn_id, metrics.route, metrics.turn_committed_at,
                     metrics.output_first_non_silent_at, metrics.bot_started_at,
                 )
-            logger.info("LATENCY RECORD | {}", json.dumps(self._record(metrics, breakdown, first_audible), sort_keys=True))
+            record = self._record(metrics, breakdown, first_audible)
+            logger.info("LATENCY RECORD | {}", json.dumps(record, sort_keys=True))
+            if self._telemetry_report is not None:
+                self._telemetry_report.add(record)
         finally:
             self._reporting_turn_ids.discard(metrics.turn_id)
 
@@ -964,6 +972,9 @@ class LiveLatencyObserver(BaseObserver):
             "tenant_id": getattr(self._session, "tenant_id", "legacy"),
             "agent_version": getattr(getattr(self._session, "agent", None), "version", "legacy"),
             "turn_id": metrics.turn_id,
+            "hosted_llm_ttft_ms": self._ordered_ms(metrics.llm_request_started_at, metrics.llm_first_token_at) if metrics.hosted_llm_used else None,
+            "tts_first_pcm_ms": self._ordered_ms(metrics.tts_requested_at, metrics.tts_first_audio_at),
+            "tts_first_audible_ms": self._ordered_ms(metrics.tts_requested_at, metrics.tts_first_non_silent_at),
             "route": metrics.route,
             "endpoint_mode": metrics.endpoint_profile,
             "model": getattr(self._controller, "_model", "unknown"),
@@ -1021,7 +1032,10 @@ class LiveLatencyObserver(BaseObserver):
             "first_audible_at": first_audible,
             "hard_eot_to_first_audible_ms": self._ms(metrics.turn_committed_at, first_audible),
             "raw_speech_end_to_first_audible_ms": self._ordered_ms(metrics.last_voiced_at, first_audible),
-            "first_audible_source": "output_non_silent_pcm" if first_audible is not None else "unavailable",
+            "first_audible_source": (
+                "output_non_silent_pcm" if metrics.output_first_non_silent_at is not None
+                else "bot_started_fallback" if first_audible is not None else "unavailable"
+            ),
             "bot_started_at": metrics.bot_started_at,
             "raw_speech_end_to_eager_eot_ms": self._ordered_ms(metrics.last_voiced_at, metrics.eager_eot_at),
             "eager_eot_to_hard_eot_ms": self._ordered_ms(metrics.eager_eot_at, metrics.turn_committed_at),
@@ -1082,6 +1096,11 @@ class LiveLatencyObserver(BaseObserver):
             phantom_pending_reports,
         )
         self._log_call_summary(list(metrics_by_turn.values()))
+        if self._telemetry_report is not None:
+            # Reconcile from final timestamps, including a last response whose
+            # async log task may still be pending when the pipeline shuts down.
+            for metrics in audible_turns:
+                self._telemetry_report.add(self._record(metrics, None, metrics.output_first_non_silent_at))
         if self._reported_turn_ids:
             logger.info(
                 "V2 OPTIMIZATION SUMMARY | {}",
@@ -1101,6 +1120,8 @@ class LiveLatencyObserver(BaseObserver):
                 f"EOT->FIRST-AUDIBLE SUMMARY | route={route} tts={self._tts_transport} n={len(ordered)} p50={percentile(.50)} ms "
                 f"p90={percentile(.90)} ms p95={percentile(.95)} ms p99={percentile(.99)} ms max={ordered[-1]} ms"
             )
+        if self._telemetry_report is not None:
+            await self._telemetry_report.finish()
         await super().cleanup()
 
     def _log_call_summary(self, all_turns: list[TurnMetrics]) -> None:
@@ -1125,12 +1146,12 @@ class LiveLatencyObserver(BaseObserver):
 
         def stats(items: list[int]) -> str:
             if not items:
-                return "n=0 p50=None p90=None p95=None max=None"
+                return "n=0 p50=None p90=None p95=None p99=None max=None"
             ordered = sorted(items)
             pick = lambda p: ordered[max(0, math.ceil(len(ordered) * p) - 1)]
             return (
                 f"n={len(ordered)} p50={pick(.50)} p90={pick(.90)} "
-                f"p95={pick(.95)} max={ordered[-1]}"
+                f"p95={pick(.95)} p99={pick(.99)} max={ordered[-1]}"
             )
 
         hosted = [item for item in successful if item.hosted_llm_used]
@@ -1244,6 +1265,7 @@ async def run_bot(
         raise ValueError("V2 requires a Goodbox AgentRuntimeConfig at call start")
     runtime = runtime_config
     use_flux = runtime.stt_model.lower().startswith("flux")
+    cloud_telemetry = os.getenv("ENABLE_V2_CLOUD_TELEMETRY", "true").lower() == "true"
     from voice_agent.turns.flux import OrderedFluxSTTService, flux_turn_strategies
     from voice_agent.turns.endpoint_profiles import flux_profile
     from voice_agent.runtime.flags import RuntimeFlags
@@ -1367,6 +1389,11 @@ async def run_bot(
         tts_transport=("http-batch" if controller_options and resolved_tts_transport == "http" else "websocket-stream"),
         session=v2_session if controller_options else None,
         call_origin_at=telephony_connected_at,
+        telemetry_report=SessionTelemetryReport(
+            session_id=getattr(runner_args, "session_id", None),
+            call_id=getattr(v2_session, "call_id", None),
+            directory=os.getenv("V2_TELEMETRY_REPORT_DIR", "logs/telemetry"),
+        ) if cloud_telemetry else None,
     )
     controller._latency_observer = latency_observer
 
@@ -1460,6 +1487,7 @@ async def run_bot(
         language_hints = [Language.EN, Language.HI] if runtime.stt_language == "multi" else None
         stt = OrderedFluxSTTService(
             api_key=runtime.deepgram_api_key,
+            telemetry_enabled=cloud_telemetry,
             url=os.getenv("DEEPGRAM_FLUX_URL", "wss://api.in.deepgram.com/v2/listen"),
             settings=DeepgramFluxSTTService.Settings(
                 model=runtime.stt_model,
@@ -1551,7 +1579,16 @@ async def run_bot(
             text_aggregation_mode=(TextAggregationMode.TOKEN if controller_options else TextAggregationMode.SENTENCE),
             max_buffer_delay_ms=int(os.getenv("CARTESIA_MAX_BUFFER_DELAY_MS", os.getenv("V2_TTS_BUFFER_DELAY_MS", "75"))) if controller_options else None,
         )
-    pipeline_processors = [transport.input(), stt, controller, user_aggregator, tts]
+    pipeline_processors = [transport.input(), stt]
+    if use_flux and cloud_telemetry:
+        pipeline_processors.append(TelemetryBoundaryFilter())
+    pipeline_processors.extend([controller, user_aggregator, tts])
+    if cloud_telemetry:
+        logger.info(
+            "CLOUD TELEMETRY CONFIG | stt={} llm={} model={} tts={} "
+            "flux_speech_adapter={} native_metrics=true partial_text=false",
+            stt.name, controller.name, runtime.llm_model, tts.name, use_flux,
+        )
     if controller_options and os.getenv("ENABLE_TTS_LEADING_SILENCE_TRIM", "true").lower() == "true":
         from voice_agent.speech.audio_quality import InitialSilenceTrimmer
         pipeline_processors.append(InitialSilenceTrimmer())
@@ -1573,7 +1610,7 @@ async def run_bot(
         rtvi_processor=rtvi_processor,
         # Cartesia's token stream emits a punctuation-only aggregated segment
         # to the stock observer. Completed answers are sent explicitly above.
-        rtvi_observer_params=RTVIObserverParams(
+        rtvi_observer_params=cloud_rtvi_params() if cloud_telemetry else RTVIObserverParams(
             bot_output_enabled=False,
             bot_llm_enabled=False,
             bot_tts_enabled=False,
@@ -1585,7 +1622,7 @@ async def run_bot(
             enable_usage_metrics=True,
             send_initial_empty_metrics=False,
         ),
-        observers=[latency_observer],
+        observers=[latency_observer, UserBotLatencyObserver()],
     )
 
     @transport.event_handler("on_client_disconnected")
