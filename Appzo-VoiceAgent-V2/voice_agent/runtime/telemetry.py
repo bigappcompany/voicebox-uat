@@ -7,9 +7,42 @@ from pathlib import Path
 from uuid import uuid4
 
 from loguru import logger
-from pipecat.frames.frames import VADUserStartedSpeakingFrame, VADUserStoppedSpeakingFrame
-from pipecat.processors.frame_processor import FrameProcessor
-from pipecat.processors.frameworks.rtvi.observer import RTVIObserverParams
+from pipecat.frames.frames import TTSSpeakFrame, VADUserStartedSpeakingFrame, VADUserStoppedSpeakingFrame
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.processors.frameworks.rtvi import models as RTVI
+from pipecat.processors.frameworks.rtvi.observer import RTVIObserver, RTVIObserverParams
+from pipecat.processors.frameworks.rtvi.processor import RTVIProcessor
+
+
+class CloudTelemetryObserver(RTVIObserver):
+    """Forward response lifecycle without changing speech or conversation text."""
+
+    async def _handle_llm_text_frame(self, frame):
+        # Completed answers are already published explicitly by the controller.
+        # Keep lifecycle events enabled without publishing partial tokens twice.
+        return
+
+    async def on_push_frame(self, data):
+        frame = data.frame
+        fixed_response = (
+            isinstance(frame, TTSSpeakFrame)
+            and data.direction == FrameDirection.DOWNSTREAM
+            and frame.id not in self._frames_seen
+            and data.source not in self._ignored_sources
+            and self._params.bot_llm_enabled
+        )
+        await super().on_push_frame(data)
+        if fixed_response:
+            # A fixed response is already fully generated. These are protocol
+            # notifications only: no LLM timing sample and no pipeline frames.
+            # Actual playback boundaries still come from the output transport.
+            await self.send_rtvi_message(RTVI.BotLLMStartedMessage())
+            await self.send_rtvi_message(RTVI.BotLLMStoppedMessage())
+
+
+class CloudTelemetryProcessor(RTVIProcessor):
+    def create_rtvi_observer(self, *, params=None, **kwargs):
+        return CloudTelemetryObserver(self, params=params, **kwargs)
 
 
 class TelemetrySpeechStartedFrame(VADUserStartedSpeakingFrame):
@@ -42,8 +75,8 @@ class TelemetryBoundaryFilter(FrameProcessor):
 def cloud_rtvi_params():
     # Preserve explicit completed-answer publishing and suppress partial text.
     # Metrics and speech boundaries are independent of those text switches.
-    # bot_llm_enabled=True forwards LLMServiceMetrics frames to Daily so the
-    # "Avg LLM TTFB" card is populated on the dashboard.
+    # bot_llm_enabled controls response lifecycle, not MetricsFrame forwarding.
+    # CloudTelemetryObserver suppresses partial LLM text independently.
     return RTVIObserverParams(
         bot_output_enabled=False,
         bot_llm_enabled=True,
